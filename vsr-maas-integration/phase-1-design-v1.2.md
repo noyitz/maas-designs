@@ -14,7 +14,7 @@
 
 ## Executive Summary
 
-This document describes how MaaS is extended to support external model providers (OpenAI, Anthropic, AWS Bedrock, etc.) by combining two complementary capabilities:
+This document describes how MaaS is extended to support external model providers by combining two complementary capabilities. The MVP focuses on **OpenAI and Anthropic** -- the two providers already supported by vSR with production-ready adapters. Additional providers (AWS Bedrock, Google Gemini) are addressed in future releases:
 
 1. **OpenShift Gateway Egress** -- Istio already supports egress via ServiceEntry and DestinationRule. These APIs allow for the explicit registration of external services in the mesh, and for the configuration of connection properties such as DNS resolution, protocols, TLS and mTLS. This design leverages these existing capabilities without introducing new connectivity or trust primitives. An AuthTokenManagement (ATM) layer is added on top to handle provider credential injection (API keys, AWS SigV4, etc.) passively at the gateway.
 
@@ -23,11 +23,10 @@ This document describes how MaaS is extended to support external model providers
 The gateway handles **network plumbing** (egress connectivity, TLS, credentials). vSR handles **application intelligence** (which model to route to and why). Neither replaces the other.
 
 **MVP scope for RHOAI 3.4 developer preview:**
-- Egress to **OpenAI and Anthropic** (similar APIs, API key auth)
+- Egress to **OpenAI and Anthropic** -- these are the providers already supported by vSR with production-ready adapters (`pkg/openai/`, `pkg/anthropic/`)
 - vSR as BBR++ for body-based model extraction and routing
 - AuthPolicy + RateLimitPolicy for access control and QoS
 - Prometheus metrics capturing model selection and token usage
-- AWS Bedrock and Google Gemini as stretch goals (complex auth, non-OpenAI APIs)
 
 **Explicitly out of scope for MVP (per Feb 10 alignment):**
 - Semantic cache (requires classifier models -- not for 3.4 dev preview)
@@ -107,7 +106,7 @@ spec:
     headerPrefix: "Bearer "
 ```
 
-This uses existing Kuadrant/Authorino patterns for source+destination token discrimination (confirmed as already supported by Sanjeev Rampal, Feb 6 meeting). The MCP gateway's Vault integration and PAT patterns are reused -- no new auth framework is designed.
+This uses existing Kuadrant/Authorino patterns for source+destination token discrimination. The MCP gateway's Vault integration and PAT patterns are reused -- no new auth framework is designed.
 
 ### 1.3 What Is Missing: Body-Based Routing
 
@@ -138,69 +137,18 @@ Basic BBR extracts the model name from the payload and promotes it to a header. 
 | Promote model name to routing header | Yes | Yes |
 | Semantic classification (domain, intent, complexity) | No | Yes (ModernBERT, ~20ms) |
 | Intelligent model selection (best model for this query) | No | Yes (14 domain categories) |
-| API translation (OpenAI -> Anthropic/Bedrock) | No | Yes (existing adapters) |
+| API translation (OpenAI, Anthropic) | No | Yes (existing adapters in MVP) |
 | Semantic caching | No | Yes (future -- not in MVP) |
 | PII detection / jailbreak prevention | No | Yes (future -- not in MVP) |
 
 For the RHOAI 3.4 MVP, vSR's role is focused on:
 - **Body-based model extraction** and header injection
 - **Model selection** when the client doesn't specify a model (or specifies a virtual model like "best")
-- **API translation** for providers with non-OpenAI-compatible APIs (stretch goal)
+- **API translation** for OpenAI and Anthropic (existing vSR adapters). Non-OpenAI providers (Bedrock, Gemini) deferred to future releases pending adapter development.
 
 Future extensions (post-MVP) add semantic cache, guardrails, and richer classification without changing the integration architecture.
 
-### 2.2 Integration Architecture
-
-```mermaid
-graph TB
-    subgraph "Client"
-        App[Application<br/>POST /v1/chat/completions]
-    end
-
-    subgraph "OpenShift Gateway (Istio/Envoy)"
-        Gateway[maas-default-gateway]
-        AuthZ[Authorino<br/>AuthPolicy: vSR access]
-        RL[Limitador<br/>RateLimitPolicy: QoS]
-    end
-
-    subgraph "vSR (BBR++ ExtProc)"
-        ExtProc[vSR ExtProc :50051<br/>Extract model from body<br/>Set routing headers]
-    end
-
-    subgraph "Internal Models (KServe)"
-        KServe1[llama3-70b]
-        KServe2[llama3-8b]
-        KServe3[granite-code-34b]
-    end
-
-    subgraph "Egress (Istio ServiceEntry + ATM)"
-        SE[ServiceEntry<br/>DNS + TLS]
-        ATM[AuthTokenManagement<br/>Credential injection]
-    end
-
-    subgraph "External Providers"
-        OpenAI[OpenAI API<br/>MVP]
-        Anthropic[Anthropic API<br/>MVP]
-        Bedrock[AWS Bedrock<br/>stretch]
-    end
-
-    App --> Gateway
-    Gateway --> AuthZ
-    AuthZ --> RL
-    RL --> ExtProc
-    ExtProc -->|X-VSR-Model-Selected: llama3-70b| Gateway
-    ExtProc -->|X-VSR-Model-Selected: openai/gpt-4o| Gateway
-    Gateway -->|Internal route| KServe1
-    Gateway -->|Internal route| KServe2
-    Gateway -->|Internal route| KServe3
-    Gateway --> SE
-    SE --> ATM
-    ATM -->|TLS + API Key| OpenAI
-    ATM -->|TLS + API Key| Anthropic
-    ATM -->|TLS + SigV4| Bedrock
-```
-
-### 2.3 Request Flow
+### 2.2 Request Flow
 
 ```mermaid
 sequenceDiagram
@@ -212,7 +160,7 @@ sequenceDiagram
     participant ATM as AuthTokenManagement
     participant Provider as External Provider
 
-    Client->>Gateway: POST /v1/chat/completions<br/>Authorization: Bearer sa-token<br/>{"model": "gpt-4o", "messages": [...]}
+    Client->>Gateway: POST /v1/chat/completions<br/>Authorization: Bearer sa-token<br/>{"model": "MoM", "messages": [{"role": "user", "content": "What is the derivative of x²?"}]}
 
     Note over Gateway,Limitador: Auth + QoS (existing RHCL)
     Gateway->>Authorino: Validate SA token
@@ -222,15 +170,14 @@ sequenceDiagram
 
     Note over Gateway,vSR: Body-Based Routing (vSR as BBR++)
     Gateway->>vSR: ExtProc: request headers + body
-    vSR->>vSR: Extract model from body: "gpt-4o"
-    vSR->>vSR: Resolve endpoint: openai/gpt-4o -> api.openai.com
-    vSR-->>Gateway: Set headers:<br/>X-VSR-Model-Selected: openai/gpt-4o<br/>X-VSR-Provider: openai<br/>Host: api.openai.com
+    vSR->>vSR: Model field is "MoM" -> intelligent routing
+    vSR->>vSR: Classify request: category=mathematics
+    vSR->>vSR: Select best model: llama3-70b (internal)
+    vSR-->>Gateway: Set headers:<br/>X-VSR-Model-Selected: llama3-70b<br/>X-VSR-Provider: kserve<br/>X-VSR-Category: mathematics<br/>Host: llama3-70b.model-serving.svc
 
-    Note over Gateway,Provider: Egress (Istio + ATM)
-    Gateway->>ATM: Match destination: api.openai.com
-    ATM->>ATM: Inject Authorization: Bearer sk-...
-    Gateway->>Provider: POST /v1/chat/completions<br/>Authorization: Bearer sk-...<br/>{"model": "gpt-4o", "messages": [...]}
-    Provider-->>Gateway: Response + usage.total_tokens: 1500
+    Note over Gateway,Provider: Route to internal model (no egress needed)
+    Gateway->>Provider: Forward to llama3-70b KServe service
+    Provider-->>Gateway: Response + usage.total_tokens: 170
 
     Note over vSR: Response filter: capture metrics
     Gateway->>vSR: ExtProc: response headers + body
@@ -240,7 +187,7 @@ sequenceDiagram
     Gateway-->>Client: OpenAI-compatible response
 ```
 
-### 2.4 Internal Model Flow (KServe)
+### 2.3 Internal Model Flow (KServe)
 
 When vSR routes to an internal model, the flow is simpler -- no egress or ATM involved:
 
@@ -264,30 +211,57 @@ sequenceDiagram
     Gateway-->>Client: Response
 ```
 
-### 2.5 Request Flow Headers
+### 2.4 Request Flow Headers
+
+vSR supports two routing modes based on the `model` field in the request body:
+
+- **`"model": "MoM"` (or `"auto"`)** -- Intelligent routing. vSR classifies the request semantically and selects the best model. This is the primary use case.
+- **`"model": "gpt-4o"`** -- Pass-through. vSR routes directly to the named model without classification.
+
+**Example A: Intelligent routing (primary use case)**
 
 ```http
-# Client Request (same for internal and external)
+# Client Request -- model is "MoM" (Mixture of Models)
 POST /v1/chat/completions
 Authorization: Bearer sa-token-xyz
 Content-Type: application/json
-{"model": "gpt-4o", "messages": [{"role": "user", "content": "Explain quantum computing"}]}
+{"model": "MoM", "messages": [{"role": "user", "content": "What is the derivative of x²?"}]}
 
 # After Auth + QoS (Authorino + Limitador)
 X-User-ID: user-123
 X-Tier: premium
 
-# After vSR ExtProc (BBR++)
-X-VSR-Model-Selected: openai/gpt-4o    # Extracted from body by vSR
-X-VSR-Provider: openai                  # Provider type for routing + metrics
-Host: api.openai.com                    # Routing target
-
-# After ATM (gateway injects provider credentials)
-Authorization: Bearer sk-proj-...       # OpenAI API key (replaces SA token)
+# After vSR ExtProc (BBR++) -- vSR classifies and selects the best model
+X-VSR-Model-Selected: llama3-70b        # vSR selected this based on "mathematics" classification
+X-VSR-Provider: kserve                   # Internal model
+X-VSR-Category: mathematics              # Semantic classification result
+Host: llama3-70b.model-serving.svc       # Routing target
 
 # Response
 HTTP/1.1 200 OK
-{"choices": [...], "usage": {"prompt_tokens": 50, "completion_tokens": 200, "total_tokens": 250}}
+{"model": "llama3-70b", "choices": [...], "usage": {"prompt_tokens": 20, "completion_tokens": 150, "total_tokens": 170}}
+```
+
+**Example B: Pass-through to external provider**
+
+```http
+# Client Request -- model is explicitly named
+POST /v1/chat/completions
+Authorization: Bearer sa-token-xyz
+Content-Type: application/json
+{"model": "gpt-4o", "messages": [{"role": "user", "content": "Explain quantum computing"}]}
+
+# After vSR ExtProc -- pass-through, no classification
+X-VSR-Model-Selected: openai/gpt-4o     # Direct pass-through
+X-VSR-Provider: openai                   # External provider
+Host: api.openai.com                     # Routing target
+
+# After ATM (gateway injects provider credentials)
+Authorization: Bearer sk-proj-...        # OpenAI API key (replaces SA token)
+
+# Response
+HTTP/1.1 200 OK
+{"model": "gpt-4o", "choices": [...], "usage": {"prompt_tokens": 50, "completion_tokens": 200, "total_tokens": 250}}
 ```
 
 ---
@@ -411,15 +385,15 @@ endpoints:
     provider: anthropic
     host: "api.anthropic.com"
 
-  # External -- Stretch (non-OpenAI API, complex auth)
-  bedrock/claude-sonnet:
-    type: external
-    provider: aws-bedrock
-    host: "bedrock-runtime.us-east-1.amazonaws.com"
-    model_id: "anthropic.claude-3-5-sonnet-20241022-v2:0"
+  # Future (not in MVP -- no vSR adapter today)
+  # bedrock/claude-sonnet:
+  #   type: external
+  #   provider: aws-bedrock
+  #   host: "bedrock-runtime.us-east-1.amazonaws.com"
+  #   model_id: "anthropic.claude-3-5-sonnet-20241022-v2:0"
 ```
 
-When a client sends `{"model": "gpt-4o"}`, vSR looks up the endpoint, sets `Host: api.openai.com` and `X-VSR-Provider: openai`, and the gateway egress handles the rest.
+When a client sends `{"model": "MoM"}`, vSR classifies the request, selects the best model from the pool, and sets routing headers accordingly. When a client sends a specific model name like `{"model": "gpt-4o"}`, vSR looks up the endpoint directly and passes through without classification. In both cases, the gateway handles egress connectivity and credential injection.
 
 ---
 
@@ -472,7 +446,7 @@ The `provider` label distinguishes internal KServe (`kserve`) from external (`op
 
 ### 6.1 MVP: OpenAI + Anthropic
 
-These providers have similar APIs and simple API key authentication. They are the primary targets for RHOAI 3.4.
+These providers have similar APIs, simple API key authentication, and -- critically -- are the two providers that vSR already supports with production-ready adapters in `pkg/openai/` and `pkg/anthropic/`. This means MVP egress requires no new adapter development in vSR.
 
 | Aspect | OpenAI | Anthropic |
 |--------|--------|-----------|
@@ -482,9 +456,9 @@ These providers have similar APIs and simple API key authentication. They are th
 | API translation needed | No (native format) | Minimal (field name mapping in response) |
 | vSR adapter | Existing (`pkg/openai/`) | Existing (`pkg/anthropic/`) |
 
-### 6.2 Stretch: AWS Bedrock
+### 6.2 Future: AWS Bedrock (Not in MVP)
 
-Bedrock is significantly more complex (per Sanjeev Rampal, Feb 6 + Feb 10 meetings):
+Bedrock is significantly more complex (per Sanjeev Rampal, Feb 6 + Feb 10 meetings) and vSR does not have a Bedrock adapter today:
 
 | Aspect | Challenge |
 |--------|-----------|
@@ -492,12 +466,9 @@ Bedrock is significantly more complex (per Sanjeev Rampal, Feb 6 + Feb 10 meetin
 | API format | Non-OpenAI-compatible. Different endpoint structure (`/model/{id}/invoke`), different body format. |
 | "OpenAI-compatible" mode | Exists but differs in key/signature methods from actual OpenAI. |
 | Translation layer | Full request/response transformation required. |
+| vSR adapter | Does not exist -- new development required. |
 
-Bedrock support requires either the gateway's API Translation WASM plugin or vSR's adapter layer to be extended. This is a stretch goal for 3.4, with full support in a later release.
-
-### 6.3 Stretch: Google Gemini
-
-Similar complexity to Bedrock -- non-OpenAI API format, different auth (OAuth2 or API key), different response structure. Deferred to the same timeline as Bedrock.
+Bedrock support requires both a new vSR adapter and either the gateway's API Translation WASM plugin or extended vSR translation logic. Targeted for a future release.
 
 ---
 
@@ -572,22 +543,12 @@ Key security properties:
 
 ## 10. Team Responsibilities
 
-| Team | Key People | Phase 1 Scope |
-|------|-----------|---------------|
-| **Gateway / Networking** | Shane Utt, Morgan Foster | Egress connectivity (ServiceEntry, DestinationRule). AuthTokenManagement API + controller. API Translation WASM (stretch -- for Bedrock/Gemini). |
-| **vSR / Semantic Router** | Huamin Chen | ExtProc: body-based model extraction, routing header injection, Prometheus metrics. API translation adapters (OpenAI, Anthropic -- existing). Future: semantic cache, classification, guardrails. |
-| **vSR Control Plane** | Ryan Cook | Operator for vSR deployment lifecycle. |
-| **MaaS / RHOAI** | Roy Nissim, Noy Itzikowitz | AuthPolicy + RateLimitPolicy configuration. MaaS GA stability (dev preview does not impact GA). Customer requirements (Wells Fargo). |
-| **Kuadrant / RHCL** | Guilherme Cassolato, Sanjeev Rampal | Authorino + Limitador configuration for vSR. Validate ATM aligns with existing Kuadrant patterns. |
-| **API Translation** | Daniele Zonca, Sanjeev Rampal | Requirements for translation layer. Evaluate GIE (Envoy AI Gateway) components for reuse. |
-
-### What Each Team Does NOT Own
-
-| Team | Out of Scope |
-|------|-------------|
-| Gateway | Does not do model selection intelligence, semantic classification, or caching |
-| vSR | Does not manage provider credentials (gateway ATM owns that). Does not build auth framework (reuses Kuadrant). |
-| MaaS | Does not build new API endpoints for Phase 1. Does not modify GA code paths. |
+| Team | Phase 1 Tasks |
+|------|--------------|
+| **Gateway / Networking** | Egress connectivity (ServiceEntry, DestinationRule). AuthTokenManagement API + controller for OpenAI + Anthropic. |
+| **vSR / Semantic Router** | ExtProc: body-based model extraction, routing header injection, Prometheus metrics. API translation adapters (OpenAI, Anthropic -- existing). Future: semantic cache, classification, guardrails. |
+| **MaaS / RHOAI** | AuthPolicy + RateLimitPolicy configuration. MaaS GA stability (dev preview does not impact GA). |
+| **Kuadrant / RHCL** | Authorino + Limitador configuration for vSR. Validate ATM aligns with existing Kuadrant patterns. |
 
 ### Critical Path
 
