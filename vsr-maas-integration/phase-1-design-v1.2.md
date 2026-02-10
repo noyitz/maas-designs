@@ -469,31 +469,54 @@ X-VSR-Model-Selected: llama3-70b     # Passed through for client visibility
 
 ### 3.1 Overview
 
-Phase 1 supports routing to external LLM providers alongside internal KServe models. From the client's perspective, the experience is identical -- the same `/v1/chat/completions` endpoint, the same auth flow, the same OpenAI-compatible response format. vSR decides whether an internal or external model is the best fit based on semantic classification, and handles the routing transparently.
+Phase 1 supports routing to external LLM providers alongside internal KServe models. From the client's perspective, the experience is identical -- the same `/v1/chat/completions` endpoint, the same auth flow, the same OpenAI-compatible response format. vSR decides whether an internal or external model is the best fit based on semantic classification.
 
-**Supported external providers in Phase 1:**
+**Supported external providers:**
 
-| Provider | Authentication | Endpoint Pattern | Response Format |
-|----------|---------------|-----------------|-----------------|
-| AWS Bedrock | IAM (SigV4) or Access Keys | `bedrock-runtime.{region}.amazonaws.com` | Bedrock-native (normalized by vSR) |
-| Azure OpenAI | API Key or Azure AD | `{resource}.openai.azure.com` | OpenAI-compatible |
-| Google Vertex AI | Service Account (OAuth2) | `{region}-aiplatform.googleapis.com` | Vertex-native (normalized by vSR) |
-| OpenAI | API Key | `api.openai.com` | OpenAI-native |
-| Anthropic | API Key | `api.anthropic.com` | Anthropic-native (normalized by vSR) |
+| Provider | Authentication | Endpoint Pattern |
+|----------|---------------|-----------------|
+| AWS Bedrock | IAM (SigV4) or Access Keys | `bedrock-runtime.{region}.amazonaws.com` |
+| Azure OpenAI | API Key or Azure AD | `{resource}.openai.azure.com` |
+| Google Vertex AI | Service Account (OAuth2) | `{region}-aiplatform.googleapis.com` |
+| OpenAI | API Key | `api.openai.com` |
+| Anthropic | API Key | `api.anthropic.com` |
 
-### 3.2 Egress Architecture
+### 3.2 Two Egress Models: Gateway-Native vs. vSR-Managed
+
+There is an active [OpenShift Gateway Egress Inference proposal](https://docs.google.com/document/d/1...) (Feb 2026, Foster/Rampal/Utt) that builds egress connectivity, auth token management, and API translation directly into the OpenShift Gateway (Istio/Envoy). This proposal is complementary to vSR -- it handles **infrastructure plumbing** while vSR handles **routing intelligence**.
+
+Phase 1 is designed to work with either egress model, and to transition seamlessly from one to the other.
+
+#### Separation of Concerns
+
+| Responsibility | vSR (Intelligence) | Gateway (Plumbing) |
+|----------------|--------------------|--------------------|
+| Semantic classification | **vSR owns** | -- |
+| Model selection decision | **vSR owns** | -- |
+| PII detection / jailbreak | **vSR owns** | -- |
+| Semantic caching | **vSR owns** | -- |
+| Connectivity & trust to external services | -- | **Gateway owns** |
+| Auth token injection (SigV4, API keys) | -- | **Gateway owns** |
+| Inference API translation (OpenAI -> Bedrock) | -- | **Gateway owns** |
+| Body-based routing (model name extraction) | -- | **Gateway owns** |
+| TLS termination and certificate management | -- | **Gateway owns** |
+
+**vSR's role is simple**: classify the request, select the best model, set a routing header (`X-VSR-Model-Selected`). It does not need to know how to authenticate to Bedrock or translate request formats. The gateway handles all of that.
+
+#### Option A: Gateway-Native Egress (Preferred -- aligns with OpenShift Gateway proposal)
 
 ```mermaid
 graph TB
     subgraph "OpenShift Cluster"
-        subgraph "vsr-system namespace"
-            vSR[vSR Router<br/>ExtProc + Envoy]
-            Secrets[Kubernetes Secrets<br/>Provider Credentials]
+        subgraph "Gateway Layer"
+            Gateway[maas-default-gateway]
+            EgressGW[Egress Inference Gateway<br/>Connectivity + Trust + Auth + Translation]
+            ATM[AuthTokenManagement<br/>Credential injection per provider]
+            APITranslation[Inference API Translation<br/>WASM plugin: OpenAI -> provider-native]
         end
 
-        subgraph "Egress Control"
-            EgressGW[Egress Gateway<br/>or NetworkPolicy]
-            ServiceEntry[ServiceEntry / ExternalName<br/>Per-provider endpoint]
+        subgraph "vsr-system"
+            vSR[vSR ExtProc<br/>Classification + Selection only]
         end
 
         subgraph "Internal Models"
@@ -503,31 +526,203 @@ graph TB
     end
 
     subgraph "External Providers"
-        Bedrock[AWS Bedrock<br/>us-east-1]
-        AzureOAI[Azure OpenAI<br/>eastus]
-        VertexAI[Google Vertex AI<br/>us-central1]
+        Bedrock[AWS Bedrock]
+        AzureOAI[Azure OpenAI]
+        OpenAI[OpenAI API]
+        Anthropic[Anthropic API]
+    end
+
+    Gateway --> vSR
+    vSR -->|X-VSR-Model-Selected: llama3-70b| Gateway
+    vSR -->|X-VSR-Model-Selected: bedrock/claude-sonnet| Gateway
+
+    Gateway -->|Internal route| KServe1
+    Gateway -->|Internal route| KServe2
+
+    Gateway --> EgressGW
+    EgressGW --> ATM
+    ATM --> APITranslation
+    EgressGW -->|TLS + SigV4| Bedrock
+    EgressGW -->|TLS + API Key| AzureOAI
+    EgressGW -->|TLS + API Key| OpenAI
+    EgressGW -->|TLS + API Key| Anthropic
+```
+
+**How it works:**
+
+1. vSR classifies the request and sets `X-VSR-Model-Selected: bedrock/claude-sonnet`
+2. The gateway's HTTPRoute matches the model header and routes to the appropriate egress backend
+3. The **AuthTokenManagement** (ATM) component (Authorino/WASM) matches the destination and injects provider credentials (SigV4, API key, etc.) into the request
+4. The **Inference API Translation** layer (WASM plugin) converts the OpenAI-format request body to the provider's native format (e.g., Bedrock's Invoke API)
+5. The egress gateway sends the request over TLS to the external provider
+6. The response flows back through the translation layer (provider-native -> OpenAI format) and returns to the client
+
+**What vSR does NOT need to do in this model:**
+- No credential management (no Secrets mounted in vSR pod)
+- No AWS SigV4 signing
+- No request/response format translation
+- No NetworkPolicy or ServiceEntry configuration
+- No provider-specific adapters
+
+**What vSR DOES do:**
+- Semantic classification and model selection (its core value)
+- Sets `X-VSR-Model-Selected` and `X-VSR-Provider` headers
+- PII detection and redaction (before the request reaches the gateway egress)
+- Prometheus metric emission (model, provider, category, tokens)
+
+#### Option B: vSR-Managed Egress (Fallback -- if Gateway egress proposal is not ready)
+
+If the OpenShift Gateway egress proposal has not landed yet, vSR can handle egress directly. This is the same architecture from the previous version of this document:
+
+```mermaid
+graph TB
+    subgraph "OpenShift Cluster"
+        subgraph "vsr-system"
+            vSR[vSR Router<br/>ExtProc + Envoy<br/>+ Provider Adapters]
+            Secrets[Kubernetes Secrets<br/>Provider Credentials]
+        end
+
+        subgraph "Egress Control"
+            NP[NetworkPolicy<br/>Allow HTTPS egress]
+            SE[ServiceEntry<br/>Per-provider endpoint]
+        end
+
+        subgraph "Internal Models"
+            KServe1[llama3-70b]
+            KServe2[llama3-8b]
+        end
+    end
+
+    subgraph "External Providers"
+        Bedrock[AWS Bedrock]
+        AzureOAI[Azure OpenAI]
         OpenAI[OpenAI API]
         Anthropic[Anthropic API]
     end
 
     vSR -->|Internal route| KServe1
     vSR -->|Internal route| KServe2
-    vSR -->|Egress| EgressGW
     Secrets -.->|Mount/inject| vSR
-    ServiceEntry -.->|DNS resolution| EgressGW
-    EgressGW -->|TLS| Bedrock
-    EgressGW -->|TLS| AzureOAI
-    EgressGW -->|TLS| VertexAI
-    EgressGW -->|TLS| OpenAI
-    EgressGW -->|TLS| Anthropic
+    vSR -->|Egress + SigV4| Bedrock
+    vSR -->|Egress + API Key| AzureOAI
+    vSR -->|Egress + API Key| OpenAI
+    vSR -->|Egress + API Key| Anthropic
+    SE -.->|DNS resolution| vSR
+    NP -.->|Allow egress| vSR
 ```
 
-### 3.3 Credential Management
+In this model, vSR takes on additional responsibilities:
+- Provider credential management (K8s Secrets mounted in pod)
+- AWS SigV4 signing (or delegates to AWS SDK)
+- Request translation (OpenAI -> provider-native)
+- Response normalization (provider-native -> OpenAI)
+- vSR already has adapters for OpenAI and Anthropic in `pkg/openai/` and `pkg/anthropic/`; Bedrock and Vertex AI adapters would need to be added
 
-External provider credentials are stored in Kubernetes Secrets and mounted into the vSR pod. vSR's model configuration references the secret name for each provider.
+### 3.3 Comparison: Gateway-Native vs. vSR-Managed Egress
+
+| Aspect | Option A: Gateway-Native (Preferred) | Option B: vSR-Managed (Fallback) |
+|--------|--------------------------------------|----------------------------------|
+| vSR complexity | **Minimal** -- classification + headers only | Higher -- adapters, credential mgmt, signing |
+| Credential security | Gateway manages credentials (Authorino/ATM) | vSR pod mounts Secrets directly |
+| API translation | Gateway WASM plugin (shared infra) | vSR Go code (per-adapter) |
+| New providers | Gateway team adds support once, all consumers benefit | vSR team must add adapter per provider |
+| Dependency | Requires OpenShift Gateway egress proposal to land | Works today with existing vSR capabilities |
+| Separation of concerns | Clean: vSR = intelligence, gateway = plumbing | Blurred: vSR does both intelligence and plumbing |
+| Reusability | Gateway egress benefits all OpenShift workloads, not just vSR | Egress logic is vSR-specific |
+
+**Recommendation**: Start with **Option A** (gateway-native) as the target architecture. If the gateway egress proposal timeline slips, **Option B** is a proven fallback -- vSR already has the adapter infrastructure. The transition from B to A is straightforward: remove provider adapters/secrets from vSR, configure gateway egress, and vSR continues setting the same routing headers.
+
+### 3.4 Gateway Egress Configuration (Option A)
+
+When using the gateway-native egress model, the following resources are needed. These are owned by the gateway/platform team, not the vSR team:
+
+**Connectivity (Istio ServiceEntry + DestinationRule):**
 
 ```yaml
-# AWS Bedrock credentials
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: aws-bedrock
+spec:
+  hosts:
+    - "bedrock-runtime.us-east-1.amazonaws.com"
+  location: MESH_EXTERNAL
+  ports:
+    - number: 443
+      name: https
+      protocol: TLS
+  resolution: DNS
+---
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: openai-api
+spec:
+  hosts:
+    - "api.openai.com"
+  location: MESH_EXTERNAL
+  ports:
+    - number: 443
+      name: https
+      protocol: TLS
+  resolution: DNS
+```
+
+**Auth Token Management (new API from gateway proposal):**
+
+```yaml
+# Conceptual -- exact API TBD by gateway proposal
+apiVersion: gateway.openshift.io/v1alpha1
+kind: AuthTokenManagement
+metadata:
+  name: bedrock-auth
+spec:
+  targetRef:
+    kind: ServiceEntry
+    name: aws-bedrock
+  authentication:
+    type: aws-sigv4
+    secretRef:
+      name: aws-bedrock-credentials
+    # Or IRSA:
+    serviceAccountRef:
+      name: gateway-egress-sa
+      roleArn: "arn:aws:iam::123456789012:role/bedrock-access"
+---
+apiVersion: gateway.openshift.io/v1alpha1
+kind: AuthTokenManagement
+metadata:
+  name: openai-auth
+spec:
+  targetRef:
+    kind: ServiceEntry
+    name: openai-api
+  authentication:
+    type: api-key
+    secretRef:
+      name: openai-credentials
+    headerName: "Authorization"
+    headerPrefix: "Bearer "
+```
+
+**Inference API Translation (gateway WASM plugin):**
+
+The gateway proposal includes a WASM plugin for translating OpenAI Chat Completions format to provider-native formats. This handles:
+
+| Direction | Translation |
+|-----------|------------|
+| Request: OpenAI -> Bedrock | `POST /v1/chat/completions` -> `POST /model/{id}/invoke` + Bedrock body format |
+| Request: OpenAI -> Anthropic | `POST /v1/chat/completions` -> `POST /v1/messages` + Anthropic body format |
+| Response: Bedrock -> OpenAI | `inputTokenCount`/`outputTokenCount` -> `usage.prompt_tokens`/`usage.completion_tokens` |
+| Response: Anthropic -> OpenAI | `usage.input_tokens`/`usage.output_tokens` -> `usage.prompt_tokens`/`usage.completion_tokens` |
+
+### 3.5 vSR-Managed Egress Configuration (Option B Fallback)
+
+If the gateway egress proposal is not available, vSR handles egress directly. This requires additional configuration in the vSR namespace:
+
+**Provider Credentials (K8s Secrets):**
+
+```yaml
 apiVersion: v1
 kind: Secret
 metadata:
@@ -539,18 +734,6 @@ data:
   AWS_SECRET_ACCESS_KEY: <base64>
   AWS_REGION: dXMtZWFzdC0x  # us-east-1
 ---
-# Azure OpenAI credentials
-apiVersion: v1
-kind: Secret
-metadata:
-  name: vsr-azure-openai-credentials
-  namespace: vsr-system
-type: Opaque
-data:
-  AZURE_OPENAI_API_KEY: <base64>
-  AZURE_OPENAI_ENDPOINT: <base64>
----
-# Generic API key provider (OpenAI, Anthropic)
 apiVersion: v1
 kind: Secret
 metadata:
@@ -561,9 +744,7 @@ data:
   OPENAI_API_KEY: <base64>
 ```
 
-**AWS Bedrock with IRSA (preferred for production):**
-
-For AWS Bedrock on OpenShift, the preferred approach is IAM Roles for Service Accounts (IRSA) via the Cloud Credential Operator or Pod Identity Webhook. This avoids storing long-lived AWS keys:
+**AWS IRSA (preferred over long-lived keys):**
 
 ```yaml
 apiVersion: v1
@@ -572,33 +753,10 @@ metadata:
   name: vsr-router
   namespace: vsr-system
   annotations:
-    # EKS/ROSA: IRSA
     eks.amazonaws.com/role-arn: "arn:aws:iam::123456789012:role/vsr-bedrock-access"
-    # Or STS-based (OpenShift on AWS)
-    openshift.io/cloud-credentials: "vsr-aws-credentials"
 ```
 
-The IAM role should have a minimal policy:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "bedrock:InvokeModel",
-        "bedrock:InvokeModelWithResponseStream"
-      ],
-      "Resource": "arn:aws:bedrock:us-east-1::foundation-model/*"
-    }
-  ]
-}
-```
-
-### 3.4 Network Egress Configuration
-
-#### Option A: Kubernetes NetworkPolicy (Simpler)
+**Network Egress (NetworkPolicy):**
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -613,133 +771,23 @@ spec:
   policyTypes:
     - Egress
   egress:
-    # Allow DNS resolution
     - to: []
       ports:
-        - protocol: UDP
-          port: 53
-        - protocol: TCP
-          port: 53
-    # Allow internal cluster traffic (KServe models)
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
     - to:
         - namespaceSelector: {}
-    # Allow external HTTPS to provider endpoints
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
-            except:
-              - 10.0.0.0/8
-              - 172.16.0.0/12
-              - 192.168.0.0/16
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]
       ports:
-        - protocol: TCP
-          port: 443
+        - { protocol: TCP, port: 443 }
 ```
 
-#### Option B: Istio ServiceEntry (More Control)
+### 3.6 External Model Routing Decision
 
-If the cluster uses Istio service mesh, use ServiceEntry resources to explicitly declare allowed external hosts:
-
-```yaml
-apiVersion: networking.istio.io/v1
-kind: ServiceEntry
-metadata:
-  name: aws-bedrock
-  namespace: vsr-system
-spec:
-  hosts:
-    - "bedrock-runtime.us-east-1.amazonaws.com"
-    - "bedrock-runtime.us-west-2.amazonaws.com"
-  location: MESH_EXTERNAL
-  ports:
-    - number: 443
-      name: https
-      protocol: TLS
-  resolution: DNS
----
-apiVersion: networking.istio.io/v1
-kind: ServiceEntry
-metadata:
-  name: azure-openai
-  namespace: vsr-system
-spec:
-  hosts:
-    - "*.openai.azure.com"
-  location: MESH_EXTERNAL
-  ports:
-    - number: 443
-      name: https
-      protocol: TLS
-  resolution: DNS
----
-apiVersion: networking.istio.io/v1
-kind: ServiceEntry
-metadata:
-  name: openai-api
-  namespace: vsr-system
-spec:
-  hosts:
-    - "api.openai.com"
-  location: MESH_EXTERNAL
-  ports:
-    - number: 443
-      name: https
-      protocol: TLS
-  resolution: DNS
----
-apiVersion: networking.istio.io/v1
-kind: ServiceEntry
-metadata:
-  name: anthropic-api
-  namespace: vsr-system
-spec:
-  hosts:
-    - "api.anthropic.com"
-  location: MESH_EXTERNAL
-  ports:
-    - number: 443
-      name: https
-      protocol: TLS
-  resolution: DNS
-```
-
-### 3.5 Response Normalization
-
-External providers return responses in different formats. vSR's ExtProc response filter normalizes all responses to the OpenAI-compatible format before returning to the client. This is transparent to the client.
-
-| Provider | Native Token Fields | Normalized To (OpenAI format) |
-|----------|-------------------|-------------------------------|
-| AWS Bedrock | `inputTokenCount`, `outputTokenCount` | `usage.prompt_tokens`, `usage.completion_tokens`, `usage.total_tokens` |
-| Azure OpenAI | `usage.prompt_tokens`, `usage.completion_tokens` | Already OpenAI-compatible (pass-through) |
-| Google Vertex AI | `usageMetadata.promptTokenCount`, `candidatesTokenCount` | `usage.prompt_tokens`, `usage.completion_tokens`, `usage.total_tokens` |
-| OpenAI | `usage.prompt_tokens`, `usage.completion_tokens` | Native format (pass-through) |
-| Anthropic | `usage.input_tokens`, `usage.output_tokens` | `usage.prompt_tokens`, `usage.completion_tokens`, `usage.total_tokens` |
-
-vSR already has adapters for multiple providers in its `pkg/openai/` and `pkg/anthropic/` packages. Phase 1 extends these adapters to emit Prometheus metrics with the normalized token counts.
-
-### 3.6 vSR Request Adaptation
-
-When routing to external providers, vSR's ExtProc translates the incoming OpenAI-compatible request to the provider's native API format. This happens inside the ExtProc before the request is forwarded:
-
-**AWS Bedrock example:**
-
-```
-Incoming (OpenAI format):
-POST /v1/chat/completions
-{"model": "claude-sonnet", "messages": [{"role": "user", "content": "..."}]}
-
-Translated by vSR ExtProc to:
-POST /model/anthropic.claude-3-5-sonnet-20241022-v2:0/invoke
-Host: bedrock-runtime.us-east-1.amazonaws.com
-Authorization: AWS4-HMAC-SHA256 ... (SigV4)
-{"anthropic_version": "bedrock-2023-05-31", "messages": [{"role": "user", "content": "..."}]}
-```
-
-The key architectural point: **the client never knows which provider is serving the request**. The client sends a standard OpenAI-compatible request and receives a standard OpenAI-compatible response.
-
-### 3.7 External Model Routing Decision
-
-vSR's semantic classification determines whether to route internally or externally. The `config.yaml` model pool treats internal and external models uniformly -- the only difference is the endpoint configuration:
+Regardless of which egress model is used (gateway-native or vSR-managed), the routing decision is the same. vSR's semantic classification determines whether to route internally or externally based on the `config.yaml` model pool:
 
 ```yaml
 # vSR config.yaml -- Internal + External model pool
@@ -775,21 +823,33 @@ endpoints:
     type: internal
     url: "granite-code-34b.model-serving.svc.cluster.local"
 
-  # External (egress to cloud providers)
+  # External (cloud providers)
   bedrock/claude-sonnet:
     type: external
     provider: aws-bedrock
-    region: us-east-1
     model_id: "anthropic.claude-3-5-sonnet-20241022-v2:0"
-    credentials_secret: vsr-aws-bedrock-credentials
+    # Option A (gateway-native): no credentials_secret needed here
+    # Option B (vSR-managed): credentials_secret: vsr-aws-bedrock-credentials
   openai/gpt-4o:
     type: external
     provider: openai
     model_id: "gpt-4o"
-    credentials_secret: vsr-openai-credentials
+    # Option A: no credentials_secret needed
+    # Option B: credentials_secret: vsr-openai-credentials
 ```
 
-**Routing criteria**: vSR selects between internal and external models purely based on semantic fit. There is no preference for internal over external in Phase 1 -- the `config.yaml` defines which domains map to which models, and the operator configures this at deployment time.
+**Routing criteria**: vSR selects between internal and external models purely based on semantic fit. The `config.yaml` defines which domains map to which models, and the operator configures this at deployment time. The key difference between egress options is only who handles credentials and translation -- not who makes the routing decision.
+
+### 3.7 Transition Path: Option B -> Option A
+
+When the OpenShift Gateway egress proposal lands, transitioning from vSR-managed to gateway-native egress requires:
+
+1. **Deploy gateway egress resources**: ServiceEntry, AuthTokenManagement, API translation WASM plugin
+2. **Remove from vSR**: Provider credential Secrets, NetworkPolicy, adapter code for external providers
+3. **Update vSR config**: Remove `credentials_secret` from external endpoint configs
+4. **No changes to**: vSR classification, model selection, header injection, Prometheus metrics, client API
+
+vSR continues setting `X-VSR-Model-Selected: bedrock/claude-sonnet` exactly as before. The only change is that the gateway now handles the downstream plumbing instead of vSR's internal adapters.
 
 ---
 
@@ -938,38 +998,43 @@ The RHCL stack is deployed and configured exactly as it is for MaaS today. The o
 
 #### vSR (Semantic Router) -- Minimal Changes
 
-| Component | Change | Status |
-|-----------|--------|--------|
-| ExtProc service | No changes to core routing logic | ✅ Existing |
-| PII / Jailbreak detection | No changes | ✅ Existing |
-| Semantic classification | No changes | ✅ Existing |
-| External provider adapters | OpenAI, Anthropic adapters exist; extend for Bedrock, Vertex AI | 🆕 Enhancement |
-| Request translation | Translate OpenAI-format requests to provider-native format | 🆕 Enhancement |
-| Response normalization | Normalize provider-native responses to OpenAI format | 🆕 Enhancement |
-| AWS SigV4 signing | Sign requests for AWS Bedrock (or delegate to SDK) | 🆕 New |
-| Semantic cache | Namespace by `X-User-ID` for multi-tenant isolation | 🆕 Enhancement |
-| `X-VSR-Model-Selected` header | Inject selected model name into response headers | 🆕 Enhancement |
-| `X-VSR-Provider` header | Inject provider type (kserve, aws-bedrock, openai, etc.) | 🆕 New |
-| `X-VSR-Category` header | Inject classification result into response headers | 🆕 Enhancement |
-| Prometheus metrics | Emit routing + token metrics with provider labels (see Section 4.1) | 🆕 New |
+| Component | Change | Option A (GW Egress) | Option B (vSR Egress) |
+|-----------|--------|---------------------|----------------------|
+| ExtProc service | No changes to core routing logic | ✅ Existing | ✅ Existing |
+| PII / Jailbreak detection | No changes | ✅ Existing | ✅ Existing |
+| Semantic classification | No changes | ✅ Existing | ✅ Existing |
+| External provider adapters | Request/response translation | **Not needed** | 🆕 Enhancement |
+| AWS SigV4 signing | Credential handling for Bedrock | **Not needed** | 🆕 New |
+| Semantic cache | Namespace by `X-User-ID` | 🆕 Enhancement | 🆕 Enhancement |
+| `X-VSR-Model-Selected` header | Inject model name | 🆕 Enhancement | 🆕 Enhancement |
+| `X-VSR-Provider` header | Inject provider type | 🆕 New | 🆕 New |
+| `X-VSR-Category` header | Inject classification result | 🆕 Enhancement | 🆕 Enhancement |
+| Prometheus metrics | Routing + token metrics with provider labels | 🆕 New | 🆕 New |
 
-#### Gateway / Envoy -- Configuration Only
+With **Option A (Gateway-native egress)**, vSR's scope is strictly classification, model selection, and header injection. No provider-specific code is needed in vSR.
 
-| Component | Change | Status |
-|-----------|--------|--------|
-| HTTPRoute for vSR | New route definition pointing to vSR service | 🆕 Configuration |
-| ExtProc filter | Configure Envoy to call vSR ExtProc | 🆕 Configuration |
-| Header sanitization | Strip `X-VSR-*` headers from incoming client requests | 🆕 Configuration |
+#### Gateway / Envoy
 
-#### Egress & External Providers -- New Configuration + Secrets
+| Component | Change | Option A (GW Egress) | Option B (vSR Egress) |
+|-----------|--------|---------------------|----------------------|
+| HTTPRoute for vSR | Route to vSR service | 🆕 Configuration | 🆕 Configuration |
+| ExtProc filter | Envoy calls vSR ExtProc | 🆕 Configuration | 🆕 Configuration |
+| Header sanitization | Strip `X-VSR-*` from client requests | 🆕 Configuration | 🆕 Configuration |
+| ServiceEntry (per provider) | Declare external hosts | 🆕 Gateway team owns | 🆕 vSR team configures |
+| AuthTokenManagement | Credential injection per provider | 🆕 Gateway team owns | **Not needed** |
+| API Translation WASM | OpenAI -> provider-native | 🆕 Gateway team owns | **Not needed** |
+| Egress routing (HTTPRoute) | Route by `X-VSR-Model-Selected` to external backends | 🆕 Gateway team owns | **Not needed** |
+
+#### Egress & External Providers (Option B only)
+
+These resources are only needed if using vSR-managed egress (Option B fallback):
 
 | Component | Change | Status |
 |-----------|--------|--------|
 | Provider credential Secrets | K8s Secrets for AWS, Azure, OpenAI, Anthropic keys | 🆕 Configuration |
 | AWS IRSA (if on ROSA/EKS) | ServiceAccount annotation for IAM role binding | 🆕 Configuration |
 | NetworkPolicy (egress) | Allow vSR pods to reach external HTTPS endpoints | 🆕 Configuration |
-| ServiceEntry (if Istio) | Declare allowed external hosts for mesh egress | 🆕 Configuration |
-| vSR model pool config | Add external endpoints to `config.yaml` with provider type + credentials ref | 🆕 Configuration |
+| vSR model pool config | Add `credentials_secret` to external endpoint entries | 🆕 Configuration |
 
 ### 4.2 Gateway Configuration
 
@@ -1012,27 +1077,52 @@ request_headers_to_remove:
 
 ### 4.3 Kubernetes Resources
 
+**Option A: Gateway-native egress (preferred)**
 ```
-vsr-system namespace:
-├── Deployment: vsr-router               # vSR ExtProc + Envoy sidecar
-├── ServiceAccount: vsr-router           # With IRSA annotation for AWS (if applicable)
-├── Service: vsr-envoy                   # ClusterIP, port 8888
-├── Service: vsr-extproc                 # ClusterIP, port 50051
-├── Service: vsr-metrics                 # ClusterIP, port 9190 (Prometheus scrape)
-├── ServiceMonitor: vsr-metrics          # Prometheus ServiceMonitor
-├── ConfigMap: vsr-config                # vSR routing config (config.yaml)
-├── Secret: vsr-aws-bedrock-credentials  # AWS Bedrock credentials (if not using IRSA)
-├── Secret: vsr-azure-openai-credentials # Azure OpenAI credentials
-├── Secret: vsr-openai-credentials       # OpenAI API key
-├── Secret: vsr-anthropic-credentials    # Anthropic API key
+vsr-system namespace:                       # vSR team owns
+├── Deployment: vsr-router                  # vSR ExtProc + Envoy sidecar
+├── Service: vsr-envoy                      # ClusterIP, port 8888
+├── Service: vsr-extproc                    # ClusterIP, port 50051
+├── Service: vsr-metrics                    # ClusterIP, port 9190 (Prometheus scrape)
+├── ServiceMonitor: vsr-metrics             # Prometheus ServiceMonitor
+├── ConfigMap: vsr-config                   # vSR routing config (config.yaml)
+├── HTTPRoute: vsr-route                    # Gateway API route
+├── AuthPolicy: vsr-access-policy           # Kuadrant auth policy
+└── RateLimitPolicy: vsr-qos-rate-limit     # Kuadrant rate limit policy
+
+gateway namespace:                          # Gateway/platform team owns
+├── ServiceEntry: aws-bedrock               # External host declaration
+├── ServiceEntry: openai-api                # External host declaration
+├── ServiceEntry: anthropic-api             # External host declaration
+├── AuthTokenManagement: bedrock-auth       # AWS SigV4 credential injection
+├── AuthTokenManagement: openai-auth        # API key injection
+├── AuthTokenManagement: anthropic-auth     # API key injection
+├── Secret: aws-bedrock-credentials         # Provider credentials
+├── Secret: openai-credentials              # Provider credentials
+├── Secret: anthropic-credentials           # Provider credentials
+└── WasmPlugin: api-translation             # OpenAI -> provider-native translation
+```
+
+**Option B: vSR-managed egress (fallback)**
+```
+vsr-system namespace:                       # vSR team owns everything
+├── Deployment: vsr-router                  # vSR ExtProc + Envoy sidecar
+├── ServiceAccount: vsr-router              # With IRSA annotation for AWS (if applicable)
+├── Service: vsr-envoy                      # ClusterIP, port 8888
+├── Service: vsr-extproc                    # ClusterIP, port 50051
+├── Service: vsr-metrics                    # ClusterIP, port 9190 (Prometheus scrape)
+├── ServiceMonitor: vsr-metrics             # Prometheus ServiceMonitor
+├── ConfigMap: vsr-config                   # vSR routing config (config.yaml)
+├── Secret: vsr-aws-bedrock-credentials     # AWS Bedrock credentials
+├── Secret: vsr-openai-credentials          # OpenAI API key
+├── Secret: vsr-anthropic-credentials       # Anthropic API key
 ├── NetworkPolicy: vsr-egress-allow-providers  # Egress to external HTTPS endpoints
-├── ServiceEntry: aws-bedrock            # (Istio only) External host declaration
-├── ServiceEntry: azure-openai           # (Istio only) External host declaration
-├── ServiceEntry: openai-api             # (Istio only) External host declaration
-├── ServiceEntry: anthropic-api          # (Istio only) External host declaration
-├── HTTPRoute: vsr-route                 # Gateway API route
-├── AuthPolicy: vsr-access-policy        # Kuadrant auth policy
-└── RateLimitPolicy: vsr-qos-rate-limit  # Kuadrant rate limit policy
+├── ServiceEntry: aws-bedrock               # (Istio only) External host declaration
+├── ServiceEntry: openai-api                # (Istio only) External host declaration
+├── ServiceEntry: anthropic-api             # (Istio only) External host declaration
+├── HTTPRoute: vsr-route                    # Gateway API route
+├── AuthPolicy: vsr-access-policy           # Kuadrant auth policy
+└── RateLimitPolicy: vsr-qos-rate-limit     # Kuadrant rate limit policy
 ```
 
 ---
@@ -1151,21 +1241,44 @@ graph TD
 | Header spoofing | Gateway strips X-VSR-*, X-User-ID, X-Tier from incoming requests | Envoy |
 | Cross-tenant cache leakage | Semantic cache namespaced by X-User-ID | vSR |
 | Unauthorized model access | Not enforced in Phase 1 (vSR routes to its own configured pool) | Deferred to Phase 2 |
-| Credential leakage (external providers) | Credentials in K8s Secrets with namespace RBAC; IRSA preferred for AWS to avoid long-lived keys | K8s Secrets / IRSA |
-| Uncontrolled egress | NetworkPolicy or Istio ServiceEntry restricts egress to declared provider endpoints only (port 443) | NetworkPolicy / Istio |
+| Credential leakage (external providers) | **Option A**: Gateway manages credentials -- vSR pod has no provider secrets. **Option B**: Credentials in K8s Secrets with namespace RBAC; IRSA preferred for AWS | Gateway ATM / K8s Secrets |
+| Uncontrolled egress | **Option A**: Gateway controls egress via ServiceEntry. **Option B**: NetworkPolicy restricts vSR pod egress | Gateway / NetworkPolicy |
 | PII sent to external providers | PII detection and redaction runs in vSR before model routing -- applies equally to internal and external models | vSR |
-| External provider MITM | All egress uses TLS; provider certificates validated by system trust store | Envoy / Go TLS |
+| External provider MITM | All egress uses TLS; provider certificates validated by system trust store | Gateway / Envoy TLS |
 | External provider data retention | Out of scope for Phase 1 -- governed by provider contracts (BAA, DPA) | Operational |
 
 ### 6.3 Egress Security Controls
 
-**Principle of least privilege for egress**: The vSR pod should only be able to reach explicitly declared external endpoints. All other egress is denied by default.
+**Option A (Gateway-native egress)** provides the strongest security posture because vSR never touches provider credentials:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ vSR Pod                                                     │
+│  - NO provider credentials in pod                           │
+│  - Only sets routing headers (X-VSR-Model-Selected)         │
+│  - PII redacted before request leaves vSR                   │
+└──────────────────────┬──────────────────────────────────────┘
+                       │ X-VSR-Model-Selected: bedrock/claude-sonnet
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Gateway Egress (Istio/Envoy)                                │
+│  - AuthTokenManagement injects SigV4/API key                │
+│  - API Translation WASM converts request format             │
+│  - ServiceEntry restricts allowed external hosts            │
+│  - Credentials never exposed to application layer           │
+└──────────────────────┬──────────────────────────────────────┘
+                       │ TLS + provider auth
+                       ▼
+               External Providers
+```
+
+**Option B (vSR-managed egress)** requires additional security controls:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │ vSR Pod                                                     │
 │  - Mounts provider credential Secrets (read-only)           │
-│  - IRSA ServiceAccount for AWS (no keys in pod)             │
+│  - IRSA ServiceAccount for AWS (no static keys in pod)      │
 │  - Credentials never logged, never in headers to client     │
 └──────────────────────┬──────────────────────────────────────┘
                        │
@@ -1183,9 +1296,9 @@ graph TD
                External Providers
 ```
 
-**Credential rotation**: Kubernetes Secrets support rotation. For AWS IRSA, credentials are automatically rotated by the token webhook. For API key-based providers, operators should rotate secrets periodically and vSR should re-read credentials without restart (via Secret volume mount with `fsnotify` or periodic reload).
+**Credential rotation**: For Option A, the gateway team manages credential rotation independently of vSR. For Option B, Kubernetes Secrets support rotation. AWS IRSA credentials are automatically rotated by the token webhook. API key-based providers should be rotated periodically, and vSR should re-read credentials without restart (via Secret volume mount with `fsnotify` or periodic reload).
 
-**PII protection for external routing**: This is particularly important when routing to external providers. The PII detection/redaction step in vSR runs before model selection, which means sensitive data is redacted before it ever leaves the cluster. The same PII protections that apply to internal models apply to external ones.
+**PII protection for external routing**: This is critical when routing to external providers. The PII detection/redaction step in vSR runs before model selection, which means sensitive data is redacted before it ever leaves the cluster. This applies regardless of which egress model is used -- vSR's PII filter always runs first.
 
 ### 6.4 What Phase 1 Does NOT Protect Against
 
@@ -1232,7 +1345,11 @@ graph TB
         KServe3[granite-code-34b InferenceService]
     end
 
-    subgraph "External Providers (Egress)"
+    subgraph "Gateway Egress (Option A)"
+        EgressGW[Egress Inference Gateway<br/>ATM + API Translation]
+    end
+
+    subgraph "External Providers"
         Bedrock[AWS Bedrock]
         AzureOAI[Azure OpenAI]
         OpenAIAPI[OpenAI API]
@@ -1252,10 +1369,12 @@ graph TB
     vSRDeploy -->|Internal| KServe1
     vSRDeploy -->|Internal| KServe2
     vSRDeploy -->|Internal| KServe3
-    vSRDeploy -->|Egress TLS| Bedrock
-    vSRDeploy -->|Egress TLS| AzureOAI
-    vSRDeploy -->|Egress TLS| OpenAIAPI
-    vSRDeploy -->|Egress TLS| AnthropicAPI
+    vSRDeploy -->|X-VSR-Model-Selected| Gateway
+    Gateway --> EgressGW
+    EgressGW -->|TLS + Auth| Bedrock
+    EgressGW -->|TLS + Auth| AzureOAI
+    EgressGW -->|TLS + Auth| OpenAIAPI
+    EgressGW -->|TLS + Auth| AnthropicAPI
     SvcMon --> Prometheus
     Prometheus --> Grafana
 ```
@@ -1286,7 +1405,7 @@ Phase 1 is designed so that every component can be extended without rework when 
 | vSR static model pool | Replace with dynamic model list from MaaS API headers |
 | No fallback logic | Add constrained re-routing when quota-limited models are exhausted |
 | `X-VSR-Model-Selected` header | Becomes `X-MaaS-Model-Selected` after MaaS validates the selection |
-| External model egress (static config) | MaaS API manages external provider registry; dynamic provider discovery |
+| External model egress (Option A: gateway / Option B: vSR) | Converge on gateway-native egress; MaaS API manages external provider registry; dynamic provider discovery |
 | Provider-side spending limits only | Per-provider budget enforcement via Limitador + MaaS billing engine |
 | No cost differentiation | Cost-aware routing: vSR considers per-model cost when selecting (internal cheaper than external) |
 
@@ -1304,10 +1423,10 @@ Phase 1 delivers a production-ready vSR integration with MaaS by making the mini
 | MaaS API changes | **Zero** -- reuses existing tier resolution endpoint |
 | vSR changes | **Minimal** -- cache namespacing + header injection + provider adapters + Prometheus metrics |
 | Gateway changes | **Configuration** -- HTTPRoute + header sanitization + ExtProc filter |
-| Egress / External models | **Configuration + adapters** -- Secrets, NetworkPolicy/ServiceEntry, provider request/response translation |
+| Egress / External models | **Option A (preferred)**: Gateway team owns egress plumbing; vSR just sets routing headers. **Option B (fallback)**: vSR-managed adapters + Secrets + NetworkPolicy |
 
 The architecture follows a deliberate strategy: **observe before you enforce**. By capturing model selection and token consumption in Prometheus (with `provider` labels distinguishing internal KServe from external AWS Bedrock, OpenAI, etc.) before building enforcement policies, Phase 1 provides real usage data to inform Phase 2's per-model quotas, per-provider budgets, and billing rates.
 
-The egress architecture enables vSR to route to the best-fit model regardless of where it runs -- internal KServe clusters or external cloud providers. The client experience is identical either way: standard OpenAI-compatible requests and responses. Provider-specific authentication (AWS SigV4, Azure AD, API keys), request translation, and response normalization are handled transparently by vSR.
+The egress architecture is designed around a clean separation of concerns: **vSR is the intelligence layer** (classification, model selection, security filtering) and the **OpenShift Gateway is the plumbing layer** (connectivity, credentials, API translation). The [OpenShift Gateway Egress Inference proposal](https://docs.google.com/document/d/1...) (Feb 2026) builds this plumbing directly into the platform, making vSR's job simpler -- it only needs to set a routing header, not manage provider credentials or translate API formats. If the gateway proposal timeline slips, vSR can handle egress directly as a fallback, with a clean transition path to gateway-native egress when it becomes available.
 
 Phase 1 is not a prototype -- it is the first production layer. Every component deployed in Phase 1 remains in place as Phase 2 adds authorization depth and cost controls on top of it.
