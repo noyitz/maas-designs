@@ -16,7 +16,7 @@
 
 This document describes how MaaS is extended to support external model providers (OpenAI, Anthropic, AWS Bedrock, etc.) by combining two complementary capabilities:
 
-1. **OpenShift Gateway Egress** ([proposal by Foster/Rampal/Utt](https://docs.google.com/document/d/1...)) -- leverages existing Istio ServiceEntry and DestinationRule for connectivity and trust to external services, and introduces AuthTokenManagement (ATM) for provider credential injection. No new connectivity or trust primitives are introduced.
+1. **OpenShift Gateway Egress** -- Istio already supports egress via ServiceEntry and DestinationRule. These APIs allow for the explicit registration of external services in the mesh, and for the configuration of connection properties such as DNS resolution, protocols, TLS and mTLS. This design leverages these existing capabilities without introducing new connectivity or trust primitives. An AuthTokenManagement (ATM) layer is added on top to handle provider credential injection (API keys, AWS SigV4, etc.) passively at the gateway.
 
 2. **vLLM Semantic Router (vSR)** -- provides body-based routing with semantic intelligence (BBR++), acting as a drop-in replacement for basic BBR within the gateway architecture. vSR reads the request payload, extracts the model name, classifies the request, and sets routing headers that the gateway uses to direct traffic to the correct backend (internal KServe or external provider).
 
