@@ -19,13 +19,15 @@ This document defines the **Phase 1** integration strategy for vLLM Semantic Rou
 - **AuthPolicy protects vSR access** -- a single authorization check determines whether the user can use the semantic router. No per-model RBAC at the gateway level.
 - **RateLimitPolicy provides QoS protection** -- rate limiting applies to the entire vSR endpoint to prevent DDoS and abuse. It is not used for per-model accounting or billing.
 - **No model lists or quotas in headers** -- vSR receives no `X-Accessible-Models` or `X-Model-Quotas` headers. It routes freely based on its own semantic classification and configured model pool.
-- **Observability captures model selection and token usage** -- the actual model selected by vSR and the tokens consumed are emitted as Prometheus metrics for monitoring and future billing readiness. This is capture-only, not enforcement.
+- **Internal and external models** -- vSR can route to both internal KServe models and external providers (AWS Bedrock, Azure OpenAI, Google Vertex AI, etc.) through a unified egress architecture. The routing decision is transparent to the client.
+- **Observability captures model selection and token usage** -- the actual model selected by vSR and the tokens consumed are emitted as Prometheus metrics for monitoring and future billing readiness. This is capture-only, not enforcement. External model usage is captured with the same metrics, including provider labels.
 
 **What Phase 1 defers to later phases:**
 - Per-model RBAC and quota-constrained routing (Phase 2)
 - Token-based rate limiting via Limitador (Phase 2)
 - Smart cache invalidation and usage tracking APIs (Phase 2)
 - Dynamic billing and cost allocation (Phase 3)
+- Per-provider cost tracking and budget enforcement (Phase 3)
 
 ---
 
@@ -51,6 +53,7 @@ This document defines the **Phase 1** integration strategy for vLLM Semantic Rou
 | RHCL changes | WASM/Lua circuit breaker | No changes | **No changes** |
 | MaaS API changes | Multiple new endpoints | accessible-models + usage APIs | **No new endpoints** |
 | vSR changes | ExtProc + fallback API | Header parsing + constrained selection | **Metric emission only** |
+| External models | Not addressed | Not addressed | **Egress support for AWS Bedrock, Azure OpenAI, etc.** |
 
 ### 1.3 Current Platform Architectures
 
@@ -107,11 +110,16 @@ graph TB
         end
     end
 
-    subgraph "Model Layer"
+    subgraph "Internal Models (KServe)"
         Model1[Math Specialist]
         Model2[Creative Model]
         Model3[Code Generator]
-        ModelN[General Purpose]
+    end
+
+    subgraph "External Models (Egress)"
+        Bedrock[AWS Bedrock<br/>Claude, Titan]
+        AzureOAI[Azure OpenAI<br/>GPT-4]
+        ExtAPI[Other Providers]
     end
 
     Envoy <--> ExtProc
@@ -124,7 +132,9 @@ graph TB
     Envoy --> Model1
     Envoy --> Model2
     Envoy --> Model3
-    Envoy --> ModelN
+    Envoy --> Bedrock
+    Envoy --> AzureOAI
+    Envoy --> ExtAPI
 ```
 
 ---
@@ -147,14 +157,19 @@ graph TB
     end
 
     subgraph "Phase 3: Execution & Observability"
-        P3A[KServe Model Execution ✅ EXISTING]
-        P3B[Prometheus Metric Capture 🆕 NEW<br/>Model selected + tokens consumed]
+        P3A{Internal or<br/>External Model?}
+        P3B[KServe Execution ✅ EXISTING]
+        P3C[External Provider Egress 🆕 NEW<br/>AWS Bedrock / Azure OpenAI / etc.]
+        P3D[Prometheus Metric Capture 🆕 NEW<br/>Model + provider + tokens consumed]
     end
 
     P1A --> P1B
     P1B --> P2
     P2 --> P3A
-    P3A --> P3B
+    P3A -->|Internal| P3B
+    P3A -->|External| P3C
+    P3B --> P3D
+    P3C --> P3D
 ```
 
 **Legend:**
@@ -206,7 +221,7 @@ sequenceDiagram
         end
     end
 
-    Note over Client,Prometheus: Phase 3: Execution & Observability
+    Note over Client,Prometheus: Phase 3: Execution & Observability (Internal Model)
 
     Gateway->>KServe: Forward request to llama3-70b
     KServe-->>Gateway: Model response<br/>usage.total_tokens: 1500
@@ -214,8 +229,56 @@ sequenceDiagram
     Gateway-->>Client: Response
 
     Note over Prometheus: Async metric emission
-    Gateway->>Prometheus: vsr_request_total{model="llama3-70b", tier="premium", category="mathematics"}
-    Gateway->>Prometheus: vsr_tokens_total{model="llama3-70b", tier="premium"} += 1500
+    Gateway->>Prometheus: vsr_requests_total{model="llama3-70b", provider="kserve", tier="premium", category="mathematics"}
+    Gateway->>Prometheus: vsr_tokens_consumed_total{model="llama3-70b", provider="kserve", tier="premium"} += 1500
+```
+
+#### External Model Sequence (AWS Bedrock Example)
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Gateway as maas-default-gateway
+    participant Authorino
+    participant Limitador
+    participant vSR as vSR ExtProc
+    participant Bedrock as AWS Bedrock<br/>(External)
+    participant Prometheus
+
+    Note over Client,Prometheus: Phase 1: Authentication & QoS (identical to internal flow)
+
+    Client->>Gateway: POST /v1/chat/completions<br/>Authorization: Bearer sa-token-xyz
+
+    Gateway->>Authorino: AuthPolicy: Validate SA token
+    Authorino-->>Gateway: Auth Success<br/>X-User-ID: user-123, X-Tier: premium
+
+    Gateway->>Limitador: RateLimitPolicy: Check request rate
+    Limitador-->>Gateway: OK (within limits)
+
+    Note over Client,Prometheus: Phase 2: Semantic Routing (vSR selects external model)
+
+    Gateway->>vSR: ExtProc: process request
+
+    vSR->>vSR: 1. PII Detection & Redaction
+    vSR->>vSR: 2. Jailbreak Detection
+    vSR->>vSR: 3. Semantic Classification: advanced_reasoning
+    vSR->>vSR: 4. Model Selection: bedrock/claude-sonnet<br/>(best fit for advanced reasoning)
+
+    vSR-->>Gateway: Route to external model<br/>X-VSR-Model-Selected: bedrock/claude-sonnet<br/>X-VSR-Provider: aws-bedrock<br/>X-VSR-Category: advanced_reasoning
+
+    Note over Client,Prometheus: Phase 3: Egress to External Provider
+
+    Gateway->>Gateway: Resolve egress cluster for aws-bedrock<br/>Inject AWS credentials (SigV4 signing)
+    Gateway->>Bedrock: POST https://bedrock-runtime.us-east-1.amazonaws.com<br/>/model/anthropic.claude-sonnet/invoke<br/>Authorization: AWS SigV4
+    Bedrock-->>Gateway: Model response<br/>usage.input_tokens: 50, usage.output_tokens: 1450
+
+    vSR->>vSR: Response filter: normalize token usage<br/>Map provider-specific fields to OpenAI format
+
+    Gateway-->>Client: OpenAI-compatible response<br/>usage.total_tokens: 1500
+
+    Note over Prometheus: Async metric emission (same metrics, external labels)
+    Gateway->>Prometheus: vsr_requests_total{model="bedrock/claude-sonnet", provider="aws-bedrock", tier="premium"}
+    Gateway->>Prometheus: vsr_tokens_consumed_total{model="bedrock/claude-sonnet", provider="aws-bedrock", tier="premium"} += 1500
 ```
 
 ### 2.3 Phase-by-Phase Detail
@@ -366,13 +429,25 @@ X-User-ID: math-user-123             # ✅ User identity (from Authorino)
 X-Tier: premium                      # ✅ Subscription tier (from Authorino)
 
 # After Phase 2: vSR Semantic Routing (no model constraints injected)
+# Example A: Internal model selected
 POST /v1/chat/completions
 Authorization: Bearer sa-token-xyz
 X-User-ID: math-user-123             # ✅ Passed through
 X-Tier: premium                      # ✅ Passed through
 X-VSR-Model-Selected: llama3-70b     # 🆕 vSR's unconstrained model choice
+X-VSR-Provider: kserve               # 🆕 Internal provider
 X-VSR-Category: mathematics          # 🆕 Semantic classification result
 Host: llama3-70b-service             # 🆕 Routing target (set by vSR ExtProc)
+
+# Example B: External model selected
+POST /v1/chat/completions
+Authorization: Bearer sa-token-xyz
+X-User-ID: math-user-123             # ✅ Passed through
+X-Tier: premium                      # ✅ Passed through
+X-VSR-Model-Selected: bedrock/claude-sonnet  # 🆕 External model choice
+X-VSR-Provider: aws-bedrock          # 🆕 External provider
+X-VSR-Category: advanced_reasoning   # 🆕 Semantic classification result
+# Host/routing handled internally by vSR (egress to Bedrock endpoint)
 
 # Phase 3: Response (after model execution)
 HTTP/1.1 200 OK
@@ -390,7 +465,335 @@ X-VSR-Model-Selected: llama3-70b     # Passed through for client visibility
 
 ---
 
-## 3. Observability Architecture
+## 3. Egress & External Model Architecture
+
+### 3.1 Overview
+
+Phase 1 supports routing to external LLM providers alongside internal KServe models. From the client's perspective, the experience is identical -- the same `/v1/chat/completions` endpoint, the same auth flow, the same OpenAI-compatible response format. vSR decides whether an internal or external model is the best fit based on semantic classification, and handles the routing transparently.
+
+**Supported external providers in Phase 1:**
+
+| Provider | Authentication | Endpoint Pattern | Response Format |
+|----------|---------------|-----------------|-----------------|
+| AWS Bedrock | IAM (SigV4) or Access Keys | `bedrock-runtime.{region}.amazonaws.com` | Bedrock-native (normalized by vSR) |
+| Azure OpenAI | API Key or Azure AD | `{resource}.openai.azure.com` | OpenAI-compatible |
+| Google Vertex AI | Service Account (OAuth2) | `{region}-aiplatform.googleapis.com` | Vertex-native (normalized by vSR) |
+| OpenAI | API Key | `api.openai.com` | OpenAI-native |
+| Anthropic | API Key | `api.anthropic.com` | Anthropic-native (normalized by vSR) |
+
+### 3.2 Egress Architecture
+
+```mermaid
+graph TB
+    subgraph "OpenShift Cluster"
+        subgraph "vsr-system namespace"
+            vSR[vSR Router<br/>ExtProc + Envoy]
+            Secrets[Kubernetes Secrets<br/>Provider Credentials]
+        end
+
+        subgraph "Egress Control"
+            EgressGW[Egress Gateway<br/>or NetworkPolicy]
+            ServiceEntry[ServiceEntry / ExternalName<br/>Per-provider endpoint]
+        end
+
+        subgraph "Internal Models"
+            KServe1[llama3-70b]
+            KServe2[llama3-8b]
+        end
+    end
+
+    subgraph "External Providers"
+        Bedrock[AWS Bedrock<br/>us-east-1]
+        AzureOAI[Azure OpenAI<br/>eastus]
+        VertexAI[Google Vertex AI<br/>us-central1]
+        OpenAI[OpenAI API]
+        Anthropic[Anthropic API]
+    end
+
+    vSR -->|Internal route| KServe1
+    vSR -->|Internal route| KServe2
+    vSR -->|Egress| EgressGW
+    Secrets -.->|Mount/inject| vSR
+    ServiceEntry -.->|DNS resolution| EgressGW
+    EgressGW -->|TLS| Bedrock
+    EgressGW -->|TLS| AzureOAI
+    EgressGW -->|TLS| VertexAI
+    EgressGW -->|TLS| OpenAI
+    EgressGW -->|TLS| Anthropic
+```
+
+### 3.3 Credential Management
+
+External provider credentials are stored in Kubernetes Secrets and mounted into the vSR pod. vSR's model configuration references the secret name for each provider.
+
+```yaml
+# AWS Bedrock credentials
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vsr-aws-bedrock-credentials
+  namespace: vsr-system
+type: Opaque
+data:
+  AWS_ACCESS_KEY_ID: <base64>
+  AWS_SECRET_ACCESS_KEY: <base64>
+  AWS_REGION: dXMtZWFzdC0x  # us-east-1
+---
+# Azure OpenAI credentials
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vsr-azure-openai-credentials
+  namespace: vsr-system
+type: Opaque
+data:
+  AZURE_OPENAI_API_KEY: <base64>
+  AZURE_OPENAI_ENDPOINT: <base64>
+---
+# Generic API key provider (OpenAI, Anthropic)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vsr-openai-credentials
+  namespace: vsr-system
+type: Opaque
+data:
+  OPENAI_API_KEY: <base64>
+```
+
+**AWS Bedrock with IRSA (preferred for production):**
+
+For AWS Bedrock on OpenShift, the preferred approach is IAM Roles for Service Accounts (IRSA) via the Cloud Credential Operator or Pod Identity Webhook. This avoids storing long-lived AWS keys:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vsr-router
+  namespace: vsr-system
+  annotations:
+    # EKS/ROSA: IRSA
+    eks.amazonaws.com/role-arn: "arn:aws:iam::123456789012:role/vsr-bedrock-access"
+    # Or STS-based (OpenShift on AWS)
+    openshift.io/cloud-credentials: "vsr-aws-credentials"
+```
+
+The IAM role should have a minimal policy:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": "arn:aws:bedrock:us-east-1::foundation-model/*"
+    }
+  ]
+}
+```
+
+### 3.4 Network Egress Configuration
+
+#### Option A: Kubernetes NetworkPolicy (Simpler)
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vsr-egress-allow-providers
+  namespace: vsr-system
+spec:
+  podSelector:
+    matchLabels:
+      app: vsr-router
+  policyTypes:
+    - Egress
+  egress:
+    # Allow DNS resolution
+    - to: []
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow internal cluster traffic (KServe models)
+    - to:
+        - namespaceSelector: {}
+    # Allow external HTTPS to provider endpoints
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+```
+
+#### Option B: Istio ServiceEntry (More Control)
+
+If the cluster uses Istio service mesh, use ServiceEntry resources to explicitly declare allowed external hosts:
+
+```yaml
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: aws-bedrock
+  namespace: vsr-system
+spec:
+  hosts:
+    - "bedrock-runtime.us-east-1.amazonaws.com"
+    - "bedrock-runtime.us-west-2.amazonaws.com"
+  location: MESH_EXTERNAL
+  ports:
+    - number: 443
+      name: https
+      protocol: TLS
+  resolution: DNS
+---
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: azure-openai
+  namespace: vsr-system
+spec:
+  hosts:
+    - "*.openai.azure.com"
+  location: MESH_EXTERNAL
+  ports:
+    - number: 443
+      name: https
+      protocol: TLS
+  resolution: DNS
+---
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: openai-api
+  namespace: vsr-system
+spec:
+  hosts:
+    - "api.openai.com"
+  location: MESH_EXTERNAL
+  ports:
+    - number: 443
+      name: https
+      protocol: TLS
+  resolution: DNS
+---
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: anthropic-api
+  namespace: vsr-system
+spec:
+  hosts:
+    - "api.anthropic.com"
+  location: MESH_EXTERNAL
+  ports:
+    - number: 443
+      name: https
+      protocol: TLS
+  resolution: DNS
+```
+
+### 3.5 Response Normalization
+
+External providers return responses in different formats. vSR's ExtProc response filter normalizes all responses to the OpenAI-compatible format before returning to the client. This is transparent to the client.
+
+| Provider | Native Token Fields | Normalized To (OpenAI format) |
+|----------|-------------------|-------------------------------|
+| AWS Bedrock | `inputTokenCount`, `outputTokenCount` | `usage.prompt_tokens`, `usage.completion_tokens`, `usage.total_tokens` |
+| Azure OpenAI | `usage.prompt_tokens`, `usage.completion_tokens` | Already OpenAI-compatible (pass-through) |
+| Google Vertex AI | `usageMetadata.promptTokenCount`, `candidatesTokenCount` | `usage.prompt_tokens`, `usage.completion_tokens`, `usage.total_tokens` |
+| OpenAI | `usage.prompt_tokens`, `usage.completion_tokens` | Native format (pass-through) |
+| Anthropic | `usage.input_tokens`, `usage.output_tokens` | `usage.prompt_tokens`, `usage.completion_tokens`, `usage.total_tokens` |
+
+vSR already has adapters for multiple providers in its `pkg/openai/` and `pkg/anthropic/` packages. Phase 1 extends these adapters to emit Prometheus metrics with the normalized token counts.
+
+### 3.6 vSR Request Adaptation
+
+When routing to external providers, vSR's ExtProc translates the incoming OpenAI-compatible request to the provider's native API format. This happens inside the ExtProc before the request is forwarded:
+
+**AWS Bedrock example:**
+
+```
+Incoming (OpenAI format):
+POST /v1/chat/completions
+{"model": "claude-sonnet", "messages": [{"role": "user", "content": "..."}]}
+
+Translated by vSR ExtProc to:
+POST /model/anthropic.claude-3-5-sonnet-20241022-v2:0/invoke
+Host: bedrock-runtime.us-east-1.amazonaws.com
+Authorization: AWS4-HMAC-SHA256 ... (SigV4)
+{"anthropic_version": "bedrock-2023-05-31", "messages": [{"role": "user", "content": "..."}]}
+```
+
+The key architectural point: **the client never knows which provider is serving the request**. The client sends a standard OpenAI-compatible request and receives a standard OpenAI-compatible response.
+
+### 3.7 External Model Routing Decision
+
+vSR's semantic classification determines whether to route internally or externally. The `config.yaml` model pool treats internal and external models uniformly -- the only difference is the endpoint configuration:
+
+```yaml
+# vSR config.yaml -- Internal + External model pool
+models:
+  domains:
+    mathematics:
+      model: llama3-70b                    # Internal KServe
+      reasoning: true
+      plugins: [system_prompt, semantic-cache]
+    advanced_reasoning:
+      model: bedrock/claude-sonnet         # External AWS Bedrock
+      reasoning: true
+      plugins: [system_prompt, semantic-cache]
+    coding:
+      model: granite-code-34b             # Internal KServe
+      plugins: [system_prompt, semantic-cache]
+    creative_writing:
+      model: openai/gpt-4o                # External OpenAI
+      plugins: [system_prompt, semantic-cache]
+    general:
+      model: llama3-8b                    # Internal KServe
+      plugins: [semantic-cache]
+
+endpoints:
+  # Internal (KServe cluster services)
+  llama3-70b:
+    type: internal
+    url: "llama3-70b.model-serving.svc.cluster.local"
+  llama3-8b:
+    type: internal
+    url: "llama3-8b.model-serving.svc.cluster.local"
+  granite-code-34b:
+    type: internal
+    url: "granite-code-34b.model-serving.svc.cluster.local"
+
+  # External (egress to cloud providers)
+  bedrock/claude-sonnet:
+    type: external
+    provider: aws-bedrock
+    region: us-east-1
+    model_id: "anthropic.claude-3-5-sonnet-20241022-v2:0"
+    credentials_secret: vsr-aws-bedrock-credentials
+  openai/gpt-4o:
+    type: external
+    provider: openai
+    model_id: "gpt-4o"
+    credentials_secret: vsr-openai-credentials
+```
+
+**Routing criteria**: vSR selects between internal and external models purely based on semantic fit. There is no preference for internal over external in Phase 1 -- the `config.yaml` defines which domains map to which models, and the operator configures this at deployment time.
+
+---
+
+## 4. Observability Architecture
 
 ### 3.1 Prometheus Metrics
 
@@ -402,15 +805,17 @@ Phase 1 introduces metrics that capture vSR routing decisions and model token co
 # Counter: Total requests processed by vSR
 - name: vsr_requests_total
   type: counter
-  labels: [user_id, tier, category, model_selected, status]
+  labels: [user_id, tier, category, model_selected, provider, status]
   description: "Total requests routed through vSR"
+  # provider: "kserve", "aws-bedrock", "azure-openai", "openai", "anthropic", "vertex-ai"
 
 # Counter: Total tokens consumed across all vSR requests
 - name: vsr_tokens_consumed_total
   type: counter
-  labels: [user_id, tier, model_selected, token_type]
+  labels: [user_id, tier, model_selected, provider, token_type]
   description: "Total tokens consumed (prompt + completion)"
   # token_type: "prompt", "completion", "total"
+  # provider: "kserve", "aws-bedrock", "azure-openai", "openai", "anthropic", "vertex-ai"
 
 # Histogram: vSR classification latency
 - name: vsr_classification_duration_seconds
@@ -443,8 +848,22 @@ Phase 1 introduces metrics that capture vSR routing decisions and model token co
 # Gauge: Models currently available in vSR routing pool
 - name: vsr_available_models
   type: gauge
-  labels: [model]
-  description: "Models available for routing"
+  labels: [model, provider]
+  description: "Models available for routing (internal and external)"
+
+# Counter: External provider egress requests
+- name: vsr_external_requests_total
+  type: counter
+  labels: [provider, model_selected, status]
+  description: "Requests sent to external providers via egress"
+  # status: "success", "error", "timeout"
+
+# Histogram: External provider response latency
+- name: vsr_external_latency_seconds
+  type: histogram
+  labels: [provider, model_selected]
+  buckets: [0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60]
+  description: "Latency for external provider responses (includes network egress)"
 ```
 
 #### Where Metrics Are Emitted
@@ -485,6 +904,10 @@ graph LR
 | P50/P95/P99 latency (heatmap) | `vsr_request_duration_seconds` | End-to-end performance monitoring |
 | Rate limit rejections (timeseries) | Limitador metrics | Monitor QoS policy effectiveness |
 | Per-user token usage (table) | `vsr_tokens_consumed_total` | Identify heavy users (pre-billing insight) |
+| Internal vs external routing (pie) | `vsr_requests_total` by `provider` | See traffic split between KServe and external providers |
+| External provider latency (heatmap) | `vsr_external_latency_seconds` | Monitor egress performance per provider |
+| External provider errors (timeseries) | `vsr_external_requests_total{status="error"}` | Detect provider outages or credential issues |
+| Token cost by provider (table) | `vsr_tokens_consumed_total` by `provider` | Pre-billing cost estimation across providers |
 
 ---
 
@@ -520,10 +943,15 @@ The RHCL stack is deployed and configured exactly as it is for MaaS today. The o
 | ExtProc service | No changes to core routing logic | ✅ Existing |
 | PII / Jailbreak detection | No changes | ✅ Existing |
 | Semantic classification | No changes | ✅ Existing |
+| External provider adapters | OpenAI, Anthropic adapters exist; extend for Bedrock, Vertex AI | 🆕 Enhancement |
+| Request translation | Translate OpenAI-format requests to provider-native format | 🆕 Enhancement |
+| Response normalization | Normalize provider-native responses to OpenAI format | 🆕 Enhancement |
+| AWS SigV4 signing | Sign requests for AWS Bedrock (or delegate to SDK) | 🆕 New |
 | Semantic cache | Namespace by `X-User-ID` for multi-tenant isolation | 🆕 Enhancement |
 | `X-VSR-Model-Selected` header | Inject selected model name into response headers | 🆕 Enhancement |
+| `X-VSR-Provider` header | Inject provider type (kserve, aws-bedrock, openai, etc.) | 🆕 New |
 | `X-VSR-Category` header | Inject classification result into response headers | 🆕 Enhancement |
-| Prometheus metrics | Emit routing + token metrics (see Section 3.1) | 🆕 New |
+| Prometheus metrics | Emit routing + token metrics with provider labels (see Section 4.1) | 🆕 New |
 
 #### Gateway / Envoy -- Configuration Only
 
@@ -532,6 +960,16 @@ The RHCL stack is deployed and configured exactly as it is for MaaS today. The o
 | HTTPRoute for vSR | New route definition pointing to vSR service | 🆕 Configuration |
 | ExtProc filter | Configure Envoy to call vSR ExtProc | 🆕 Configuration |
 | Header sanitization | Strip `X-VSR-*` headers from incoming client requests | 🆕 Configuration |
+
+#### Egress & External Providers -- New Configuration + Secrets
+
+| Component | Change | Status |
+|-----------|--------|--------|
+| Provider credential Secrets | K8s Secrets for AWS, Azure, OpenAI, Anthropic keys | 🆕 Configuration |
+| AWS IRSA (if on ROSA/EKS) | ServiceAccount annotation for IAM role binding | 🆕 Configuration |
+| NetworkPolicy (egress) | Allow vSR pods to reach external HTTPS endpoints | 🆕 Configuration |
+| ServiceEntry (if Istio) | Declare allowed external hosts for mesh egress | 🆕 Configuration |
+| vSR model pool config | Add external endpoints to `config.yaml` with provider type + credentials ref | 🆕 Configuration |
 
 ### 4.2 Gateway Configuration
 
@@ -576,14 +1014,24 @@ request_headers_to_remove:
 
 ```
 vsr-system namespace:
-├── Deployment: vsr-router           # vSR ExtProc + Envoy sidecar
-├── Service: vsr-envoy               # ClusterIP, port 8888
-├── Service: vsr-extproc             # ClusterIP, port 50051
-├── Service: vsr-metrics             # ClusterIP, port 9190 (Prometheus scrape)
-├── ServiceMonitor: vsr-metrics      # Prometheus ServiceMonitor
-├── ConfigMap: vsr-config            # vSR routing config (config.yaml)
-├── HTTPRoute: vsr-route             # Gateway API route
-├── AuthPolicy: vsr-access-policy    # Kuadrant auth policy
+├── Deployment: vsr-router               # vSR ExtProc + Envoy sidecar
+├── ServiceAccount: vsr-router           # With IRSA annotation for AWS (if applicable)
+├── Service: vsr-envoy                   # ClusterIP, port 8888
+├── Service: vsr-extproc                 # ClusterIP, port 50051
+├── Service: vsr-metrics                 # ClusterIP, port 9190 (Prometheus scrape)
+├── ServiceMonitor: vsr-metrics          # Prometheus ServiceMonitor
+├── ConfigMap: vsr-config                # vSR routing config (config.yaml)
+├── Secret: vsr-aws-bedrock-credentials  # AWS Bedrock credentials (if not using IRSA)
+├── Secret: vsr-azure-openai-credentials # Azure OpenAI credentials
+├── Secret: vsr-openai-credentials       # OpenAI API key
+├── Secret: vsr-anthropic-credentials    # Anthropic API key
+├── NetworkPolicy: vsr-egress-allow-providers  # Egress to external HTTPS endpoints
+├── ServiceEntry: aws-bedrock            # (Istio only) External host declaration
+├── ServiceEntry: azure-openai           # (Istio only) External host declaration
+├── ServiceEntry: openai-api             # (Istio only) External host declaration
+├── ServiceEntry: anthropic-api          # (Istio only) External host declaration
+├── HTTPRoute: vsr-route                 # Gateway API route
+├── AuthPolicy: vsr-access-policy        # Kuadrant auth policy
 └── RateLimitPolicy: vsr-qos-rate-limit  # Kuadrant rate limit policy
 ```
 
@@ -703,14 +1151,50 @@ graph TD
 | Header spoofing | Gateway strips X-VSR-*, X-User-ID, X-Tier from incoming requests | Envoy |
 | Cross-tenant cache leakage | Semantic cache namespaced by X-User-ID | vSR |
 | Unauthorized model access | Not enforced in Phase 1 (vSR routes to its own configured pool) | Deferred to Phase 2 |
+| Credential leakage (external providers) | Credentials in K8s Secrets with namespace RBAC; IRSA preferred for AWS to avoid long-lived keys | K8s Secrets / IRSA |
+| Uncontrolled egress | NetworkPolicy or Istio ServiceEntry restricts egress to declared provider endpoints only (port 443) | NetworkPolicy / Istio |
+| PII sent to external providers | PII detection and redaction runs in vSR before model routing -- applies equally to internal and external models | vSR |
+| External provider MITM | All egress uses TLS; provider certificates validated by system trust store | Envoy / Go TLS |
+| External provider data retention | Out of scope for Phase 1 -- governed by provider contracts (BAA, DPA) | Operational |
 
-### 6.3 What Phase 1 Does NOT Protect Against
+### 6.3 Egress Security Controls
 
-- **Unauthorized access to specific models**: Any authenticated user with vSR access can potentially be routed to any model in vSR's pool. Per-model RBAC is deferred to Phase 2.
+**Principle of least privilege for egress**: The vSR pod should only be able to reach explicitly declared external endpoints. All other egress is denied by default.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ vSR Pod                                                     │
+│  - Mounts provider credential Secrets (read-only)           │
+│  - IRSA ServiceAccount for AWS (no keys in pod)             │
+│  - Credentials never logged, never in headers to client     │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+        ┌──────────────┴──────────────┐
+        │ NetworkPolicy / ServiceEntry │
+        │ ALLOW:                       │
+        │  - *.amazonaws.com:443       │
+        │  - *.openai.azure.com:443    │
+        │  - api.openai.com:443        │
+        │  - api.anthropic.com:443     │
+        │ DENY: everything else        │
+        └──────────────┬──────────────┘
+                       │ TLS only
+                       ▼
+               External Providers
+```
+
+**Credential rotation**: Kubernetes Secrets support rotation. For AWS IRSA, credentials are automatically rotated by the token webhook. For API key-based providers, operators should rotate secrets periodically and vSR should re-read credentials without restart (via Secret volume mount with `fsnotify` or periodic reload).
+
+**PII protection for external routing**: This is particularly important when routing to external providers. The PII detection/redaction step in vSR runs before model selection, which means sensitive data is redacted before it ever leaves the cluster. The same PII protections that apply to internal models apply to external ones.
+
+### 6.4 What Phase 1 Does NOT Protect Against
+
+- **Unauthorized access to specific models**: Any authenticated user with vSR access can potentially be routed to any model in vSR's pool (internal or external). Per-model RBAC is deferred to Phase 2.
 - **Token overconsumption**: No per-model or per-user token quotas are enforced. A user could consume large amounts of tokens within the request rate limit. Prometheus metrics provide visibility but not enforcement.
-- **Cost-based abuse**: Without billing enforcement, a free-tier user could be routed to an expensive model. This is acceptable in Phase 1 because the vSR model pool should be curated to match the intended audience.
+- **Cost-based abuse**: Without billing enforcement, a free-tier user could be routed to an expensive external model (e.g., GPT-4o via OpenAI). This is acceptable in Phase 1 because the vSR model pool should be curated to match the intended audience.
+- **External provider cost overruns**: No budget caps on external API spend. Prometheus captures usage but does not enforce limits.
 
-**Mitigation for Phase 1**: Operators should configure vSR's model pool (`config.yaml`) to only include models appropriate for the expected user base. This is a deployment-time control, not a runtime policy.
+**Mitigation for Phase 1**: Operators should configure vSR's model pool (`config.yaml`) to only include models appropriate for the expected user base and budget. This is a deployment-time control, not a runtime policy. For external providers, operators should set provider-side spending limits (e.g., AWS Bedrock quotas, OpenAI usage limits) as a backstop.
 
 ---
 
@@ -745,7 +1229,14 @@ graph TB
     subgraph "model-serving namespaces"
         KServe1[llama3-70b InferenceService]
         KServe2[llama3-8b InferenceService]
-        KServe3[granite-7b InferenceService]
+        KServe3[granite-code-34b InferenceService]
+    end
+
+    subgraph "External Providers (Egress)"
+        Bedrock[AWS Bedrock]
+        AzureOAI[Azure OpenAI]
+        OpenAIAPI[OpenAI API]
+        AnthropicAPI[Anthropic API]
     end
 
     subgraph "monitoring"
@@ -758,42 +1249,28 @@ graph TB
     AuthP -.-> Authorino
     RLP -.-> Limitador
     Authorino -.-> MaaSAPI
-    vSRDeploy --> KServe1
-    vSRDeploy --> KServe2
-    vSRDeploy --> KServe3
+    vSRDeploy -->|Internal| KServe1
+    vSRDeploy -->|Internal| KServe2
+    vSRDeploy -->|Internal| KServe3
+    vSRDeploy -->|Egress TLS| Bedrock
+    vSRDeploy -->|Egress TLS| AzureOAI
+    vSRDeploy -->|Egress TLS| OpenAIAPI
+    vSRDeploy -->|Egress TLS| AnthropicAPI
     SvcMon --> Prometheus
     Prometheus --> Grafana
 ```
 
 ### 7.2 vSR Model Pool Configuration
 
-In Phase 1, vSR's model pool is configured statically in `config.yaml`. This replaces the dynamic `X-Accessible-Models` approach from v1.1:
+In Phase 1, vSR's model pool is configured statically in `config.yaml`. This replaces the dynamic `X-Accessible-Models` approach from v1.1. The configuration supports both internal (KServe) and external (cloud provider) models uniformly.
 
-```yaml
-# vSR config.yaml -- Phase 1 model pool
-models:
-  domains:
-    mathematics:
-      model: llama3-70b
-      reasoning: true
-      system_prompt: "You are a mathematics expert..."
-      plugins: [system_prompt, semantic-cache]
-    coding:
-      model: granite-code-34b
-      reasoning: false
-      system_prompt: "You are a code assistant..."
-      plugins: [system_prompt, semantic-cache]
-    general:
-      model: llama3-8b
-      reasoning: false
-      plugins: [semantic-cache]
+See Section 3.7 for the full configuration example including both internal and external endpoints.
 
-# Model endpoints (KServe services)
-endpoints:
-  llama3-70b: "llama3-70b.model-serving.svc.cluster.local"
-  llama3-8b: "llama3-8b.model-serving.svc.cluster.local"
-  granite-code-34b: "granite-code-34b.model-serving.svc.cluster.local"
-```
+**Operator responsibilities for external models:**
+- Provision and configure provider credentials as Kubernetes Secrets
+- Set provider-side spending limits as a backstop (e.g., AWS Bedrock service quotas, OpenAI usage limits)
+- Configure NetworkPolicy or ServiceEntry for egress to each provider
+- Choose appropriate models per domain based on cost, latency, and capability trade-offs
 
 ---
 
@@ -809,8 +1286,11 @@ Phase 1 is designed so that every component can be extended without rework when 
 | vSR static model pool | Replace with dynamic model list from MaaS API headers |
 | No fallback logic | Add constrained re-routing when quota-limited models are exhausted |
 | `X-VSR-Model-Selected` header | Becomes `X-MaaS-Model-Selected` after MaaS validates the selection |
+| External model egress (static config) | MaaS API manages external provider registry; dynamic provider discovery |
+| Provider-side spending limits only | Per-provider budget enforcement via Limitador + MaaS billing engine |
+| No cost differentiation | Cost-aware routing: vSR considers per-model cost when selecting (internal cheaper than external) |
 
-**Data continuity**: The Prometheus metrics collected in Phase 1 (`vsr_tokens_consumed_total` by model, user, tier) provide the historical data needed to configure accurate per-model token quotas when Phase 2 launches. This means Phase 1 is not throwaway -- it is the data collection period for Phase 2 policy tuning.
+**Data continuity**: The Prometheus metrics collected in Phase 1 (`vsr_tokens_consumed_total` by model, user, tier, provider) provide the historical data needed to configure accurate per-model token quotas and per-provider budgets when Phase 2 launches. This means Phase 1 is not throwaway -- it is the data collection period for Phase 2 policy tuning. The `provider` label on all metrics gives immediate visibility into internal vs. external cost distribution.
 
 ---
 
@@ -822,9 +1302,12 @@ Phase 1 delivers a production-ready vSR integration with MaaS by making the mini
 |----------|-------|
 | RHCL changes | **Zero** -- configuration only (AuthPolicy + RateLimitPolicy) |
 | MaaS API changes | **Zero** -- reuses existing tier resolution endpoint |
-| vSR changes | **Minimal** -- cache namespacing + header injection + Prometheus metrics |
+| vSR changes | **Minimal** -- cache namespacing + header injection + provider adapters + Prometheus metrics |
 | Gateway changes | **Configuration** -- HTTPRoute + header sanitization + ExtProc filter |
+| Egress / External models | **Configuration + adapters** -- Secrets, NetworkPolicy/ServiceEntry, provider request/response translation |
 
-The architecture follows a deliberate strategy: **observe before you enforce**. By capturing model selection and token consumption in Prometheus before building enforcement policies, Phase 1 provides real usage data to inform Phase 2's per-model quotas and billing rates. This avoids the common pitfall of designing quota policies based on assumptions rather than actual traffic patterns.
+The architecture follows a deliberate strategy: **observe before you enforce**. By capturing model selection and token consumption in Prometheus (with `provider` labels distinguishing internal KServe from external AWS Bedrock, OpenAI, etc.) before building enforcement policies, Phase 1 provides real usage data to inform Phase 2's per-model quotas, per-provider budgets, and billing rates.
+
+The egress architecture enables vSR to route to the best-fit model regardless of where it runs -- internal KServe clusters or external cloud providers. The client experience is identical either way: standard OpenAI-compatible requests and responses. Provider-specific authentication (AWS SigV4, Azure AD, API keys), request translation, and response normalization are handled transparently by vSR.
 
 Phase 1 is not a prototype -- it is the first production layer. Every component deployed in Phase 1 remains in place as Phase 2 adds authorization depth and cost controls on top of it.
