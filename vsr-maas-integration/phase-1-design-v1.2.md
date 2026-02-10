@@ -7,20 +7,28 @@
 **Date**: February 2026
 **Author**: Noy Itzikowitz
 **Previous Versions**: [v1.0](https://github.com/noyitz/maas-designs) (Dec 2025), [v1.1](https://github.com/noyitz/maas-designs) (Jan 2026)
+**Release Target**: Dev Preview on top of MaaS GA (not blocking MaaS GA release)
+**MVP Driver**: Wells Fargo -- combination of egress + local model routing
 
 ---
 
 ## Executive Summary
 
-This document defines the **Phase 1** integration strategy for vLLM Semantic Router (vSR) with the Models-as-a-Service (MaaS) platform. Phase 1 prioritizes a minimal, production-ready integration that gets vSR running behind MaaS security and QoS policies with the least amount of new development.
+This document defines the **Phase 1** integration strategy for vLLM Semantic Router (vSR) with the Models-as-a-Service (MaaS) platform. Phase 1 is a **dev preview** that gets vSR running behind MaaS security and QoS policies with the least amount of new development, without impacting MaaS GA stability.
+
+This design reflects the outcomes of the Feb 6, 2026 AI Routing alignment meeting, which established clear ownership boundaries between the OpenShift Gateway team (egress plumbing), vSR team (routing intelligence), TrustyAI team (guardrails), and MaaS team (policy configuration and GA stability).
 
 **Key design decisions for Phase 1:**
 
-- **AuthPolicy protects vSR access** -- a single authorization check determines whether the user can use the semantic router. No per-model RBAC at the gateway level.
+- **Dev preview positioning** -- Phase 1 is staged as a preview/demo capability on top of MaaS GA core. It does not block or destabilize the MaaS GA release.
+- **AuthPolicy protects vSR access** -- a single authorization check determines whether the user can use the semantic router. No per-model RBAC at the gateway level. Reuses existing authentication patterns from MCP gateway and Kuadrant (source+destination discrimination).
 - **RateLimitPolicy provides QoS protection** -- rate limiting applies to the entire vSR endpoint to prevent DDoS and abuse. It is not used for per-model accounting or billing.
 - **No model lists or quotas in headers** -- vSR receives no `X-Accessible-Models` or `X-Model-Quotas` headers. It routes freely based on its own semantic classification and configured model pool.
-- **Internal and external models** -- vSR can route to both internal KServe models and external providers (AWS Bedrock, Azure OpenAI, Google Vertex AI, etc.) through a unified egress architecture. The routing decision is transparent to the client.
-- **Observability captures model selection and token usage** -- the actual model selected by vSR and the tokens consumed are emitted as Prometheus metrics for monitoring and future billing readiness. This is capture-only, not enforcement. External model usage is captured with the same metrics, including provider labels.
+- **vSR is the body-based routing (BBR++) layer** -- the OpenShift Gateway cannot examine request bodies today. vSR provides body-based model extraction plus semantic intelligence (classification, caching, security). This is essential for OpenAI API compatibility, which requires extracting the model name from the JSON payload.
+- **Internal and external models** -- vSR routes to both internal KServe models and external providers through a unified architecture. Egress plumbing (connectivity, trust, auth token management) is owned by the OpenShift Gateway team. vSR only sets routing headers.
+- **MVP providers: OpenAI + Anthropic** -- these are the primary targets for Phase 1. AWS Bedrock and Google Gemini are stretch goals due to additional complexity (non-OpenAI-compatible APIs, dynamic key generation).
+- **Guardrails align with TrustyAI** -- vSR's PII detection and jailbreak prevention plugins are designed as composable components that align with the TrustyAI gateway guardrail integration being built by the TrustyAI + Gateway teams.
+- **Observability captures model selection and token usage** -- the actual model selected by vSR and the tokens consumed are emitted as Prometheus metrics for monitoring and future billing readiness. This is capture-only, not enforcement.
 
 **What Phase 1 defers to later phases:**
 - Per-model RBAC and quota-constrained routing (Phase 2)
@@ -28,6 +36,7 @@ This document defines the **Phase 1** integration strategy for vLLM Semantic Rou
 - Smart cache invalidation and usage tracking APIs (Phase 2)
 - Dynamic billing and cost allocation (Phase 3)
 - Per-provider cost tracking and budget enforcement (Phase 3)
+- Full Bedrock/Gemini support with API translation (Phase 2, pending gateway WASM readiness)
 
 ---
 
@@ -35,9 +44,13 @@ This document defines the **Phase 1** integration strategy for vLLM Semantic Rou
 
 ### 1.1 Phase 1 Design Principles
 
+- **Dev preview, not GA**: Ship as a preview capability on top of MaaS GA without impacting GA stability
 - **Simplicity over completeness**: Ship a working integration with minimal new components
 - **Security first**: Users must authenticate before reaching vSR
+- **Reuse existing patterns**: Leverage MCP gateway auth patterns, Kuadrant source+destination discrimination, and existing Istio egress capabilities -- don't build new auth or egress from scratch
 - **QoS over accounting**: Rate limits prevent abuse, not track spend
+- **Composable plugins**: vSR's features (security, routing, caching, enhancement) are independently selectable plugins -- operators cherry-pick what they need for their deployment
+- **Clear ownership boundaries**: vSR = routing intelligence, Gateway = network plumbing, TrustyAI = guardrail framework, MaaS = policy configuration
 - **Observability from day one**: Capture routing decisions and token usage in Prometheus so future phases have data to build on
 - **No header pollution**: Keep the request flow clean -- vSR operates with its own intelligence, unconstrained by gateway-injected model lists
 
@@ -90,7 +103,9 @@ graph TB
     RHOAI --> Models
 ```
 
-#### vSR Platform
+#### vSR Platform -- Composable Plugin Architecture
+
+vSR implements a composable plugin system organized into four layers. Operators can cherry-pick which plugins to enable per deployment:
 
 ```mermaid
 graph TB
@@ -98,15 +113,24 @@ graph TB
         Envoy[Envoy Proxy<br/>:8888]
     end
 
-    subgraph "Processing Layer"
-        ExtProc[Semantic Router<br/>ExtProc Server<br/>:50051]
+    subgraph "vSR ExtProc :50051"
+        subgraph "Security Layer (aligns with TrustyAI)"
+            PIIDetector[PII Detection Plugin]
+            JailbreakGuard[Jailbreak Prevention Plugin]
+        end
 
-        subgraph "Router Components"
-            Classifier[BERT Classifier<br/>ModernBERT]
-            PIIDetector[PII Detector]
-            JailbreakGuard[Jailbreak Guard]
-            Cache[Semantic Cache]
-            ToolsSelector[Tools Selector]
+        subgraph "Routing Layer (BBR++)"
+            Classifier[Semantic Classification<br/>ModernBERT]
+            ModelSelection[Model Selection<br/>Body-Based Routing]
+        end
+
+        subgraph "Optimization Layer"
+            Cache[Semantic Cache Plugin]
+            ToolsSelector[Tool Selection Plugin]
+        end
+
+        subgraph "Enhancement Layer"
+            ReasoningMode[Reasoning Mode Plugin]
         end
     end
 
@@ -116,26 +140,44 @@ graph TB
         Model3[Code Generator]
     end
 
-    subgraph "External Models (Egress)"
-        Bedrock[AWS Bedrock<br/>Claude, Titan]
-        AzureOAI[Azure OpenAI<br/>GPT-4]
-        ExtAPI[Other Providers]
+    subgraph "External Models (via Gateway Egress)"
+        OpenAIExt[OpenAI API]
+        AnthropicExt[Anthropic API]
+        BedrockExt[AWS Bedrock<br/>stretch goal]
     end
 
-    Envoy <--> ExtProc
-    ExtProc --> Classifier
-    ExtProc --> PIIDetector
-    ExtProc --> JailbreakGuard
-    ExtProc --> Cache
-    ExtProc --> ToolsSelector
+    Envoy <--> PIIDetector
+    PIIDetector --> JailbreakGuard
+    JailbreakGuard --> Classifier
+    Classifier --> ModelSelection
+    ModelSelection --> Cache
+    Cache --> ToolsSelector
 
     Envoy --> Model1
     Envoy --> Model2
     Envoy --> Model3
-    Envoy --> Bedrock
-    Envoy --> AzureOAI
-    Envoy --> ExtAPI
+    Envoy --> OpenAIExt
+    Envoy --> AnthropicExt
+    Envoy --> BedrockExt
 ```
+
+**Plugin configurability:**
+```yaml
+vsr_composition:
+  security_pipeline:           # Aligns with TrustyAI guardrail framework
+    pii_detection: true
+    jailbreak_prevention: true
+  routing_pipeline:            # BBR++ -- the gateway cannot do this today
+    semantic_classification: true
+    model_selection: true
+  optimization_pipeline:
+    semantic_cache: true
+    tool_selection: false       # Disabled if MCP Gateway handles this
+  enhancement_pipeline:
+    reasoning_mode: true
+```
+
+> **Why vSR is essential for OpenAI API compatibility**: The OpenShift Gateway today supports only path-based routing. It cannot examine request bodies. OpenAI's Chat Completions API places the model name inside the JSON payload (`{"model": "gpt-4o", ...}`), not in the URL path. vSR's ExtProc reads the request body, extracts the model, and performs semantic classification on top -- making it a "BBR++" (body-based router with intelligence). Without vSR (or equivalent), the gateway cannot route OpenAI-compatible requests by model.
 
 ---
 
@@ -328,7 +370,7 @@ spec:
               selector: auth.metadata.user-tier.tier
 ```
 
-This is the same pattern MaaS uses today. The only difference is the `targetRef` points to the vSR HTTPRoute instead of a model-specific route.
+This is the same pattern MaaS uses today. The only difference is the `targetRef` points to the vSR HTTPRoute instead of a model-specific route. Per the Feb 6 alignment meeting, this reuses existing authentication patterns from the MCP gateway (Vault integration, PATs) and Kuadrant's source+destination token discrimination (confirmed by Sanjeev Rampal as already supported). No new auth framework is needed.
 
 **RateLimitPolicy** -- QoS / DDoS Protection:
 
@@ -381,21 +423,30 @@ spec:
 - QoS/DDoS protection is effectively achieved by capping request frequency
 - Token consumption is captured via Prometheus for visibility, but not enforced at the gateway
 
-#### Phase 2: Semantic Routing (vSR)
+#### Phase 2: Semantic Routing (vSR as BBR++)
 
 vSR operates as it does today with **no constraints from MaaS**. It receives the authenticated request with `X-User-ID` and `X-Tier` headers (for cache namespacing and observability) but no model lists or quotas.
 
-**What vSR does (unchanged from standalone operation):**
-1. PII detection and redaction
-2. Jailbreak detection (blocks malicious prompts with 403)
-3. Semantic classification via ModernBERT (domain, intent, complexity)
-4. Semantic cache lookup (namespaced by `X-User-ID` for multi-tenant isolation)
-5. Model selection based on classification result and configured routing rules
+**What vSR does (composable plugin pipeline):**
+
+1. **Security layer** (aligns with TrustyAI guardrail framework):
+   - PII detection and redaction
+   - Jailbreak detection (blocks malicious prompts with 403)
+   - These plugins are designed to be compatible with the TrustyAI gateway guardrail integration being built by the TrustyAI + Gateway teams. In future phases, these may be consolidated into a shared guardrail framework.
+
+2. **Routing layer** (BBR++ -- unique to vSR):
+   - Body-based model extraction from OpenAI-format JSON payload
+   - Semantic classification via ModernBERT (domain, intent, complexity)
+   - Model selection based on classification result and configured routing rules
+
+3. **Optimization layer**:
+   - Semantic cache lookup (namespaced by `X-User-ID` for multi-tenant isolation)
 
 **What vSR adds for Phase 1 (new):**
 - Injects `X-VSR-Model-Selected` header with the chosen model name
+- Injects `X-VSR-Provider` header with the provider type
 - Injects `X-VSR-Category` header with the classification result
-- These headers are used downstream for Prometheus metric labeling only
+- These headers are used downstream for gateway egress routing and Prometheus metric labeling
 
 **Multi-tenant cache isolation:**
 
@@ -471,21 +522,23 @@ X-VSR-Model-Selected: llama3-70b     # Passed through for client visibility
 
 Phase 1 supports routing to external LLM providers alongside internal KServe models. From the client's perspective, the experience is identical -- the same `/v1/chat/completions` endpoint, the same auth flow, the same OpenAI-compatible response format. vSR decides whether an internal or external model is the best fit based on semantic classification.
 
-**Supported external providers:**
+**Phase 1 MVP providers:**
 
-| Provider | Authentication | Endpoint Pattern |
-|----------|---------------|-----------------|
-| AWS Bedrock | IAM (SigV4) or Access Keys | `bedrock-runtime.{region}.amazonaws.com` |
-| Azure OpenAI | API Key or Azure AD | `{resource}.openai.azure.com` |
-| Google Vertex AI | Service Account (OAuth2) | `{region}-aiplatform.googleapis.com` |
-| OpenAI | API Key | `api.openai.com` |
-| Anthropic | API Key | `api.anthropic.com` |
+| Provider | Authentication | Endpoint Pattern | Phase 1 Status |
+|----------|---------------|-----------------|----------------|
+| OpenAI | API Key | `api.openai.com` | **MVP** -- OpenAI-compatible, simplest integration |
+| Anthropic | API Key | `api.anthropic.com` | **MVP** -- API key auth, well-understood format |
+| AWS Bedrock | IAM (SigV4) + dynamic key generation | `bedrock-runtime.{region}.amazonaws.com` | **Stretch goal** -- non-OpenAI-compatible, complex auth (SigV4 with time-based key rotation) |
+| Google Gemini | API Key or OAuth2 | `generativelanguage.googleapis.com` | **Stretch goal** -- non-OpenAI-compatible API |
+| Azure OpenAI | API Key or Azure AD | `{resource}.openai.azure.com` | **Phase 2** -- OpenAI-compatible but Azure AD auth adds complexity |
+
+> **Why Bedrock is harder**: Per the Feb 6 alignment meeting (Sanjeev Rampal), even Bedrock's "OpenAI-compatible" endpoints differ significantly in key and signature methods, requiring dynamic key generation based on time of day. This requires dedicated translation logic that is TBD between vSR adapters and gateway WASM plugins.
 
 ### 3.2 Two Egress Models: Gateway-Native vs. vSR-Managed
 
-There is an active [OpenShift Gateway Egress Inference proposal](https://docs.google.com/document/d/1...) (Feb 2026, Foster/Rampal/Utt) that builds egress connectivity, auth token management, and API translation directly into the OpenShift Gateway (Istio/Envoy). This proposal is complementary to vSR -- it handles **infrastructure plumbing** while vSR handles **routing intelligence**.
+The OpenShift Gateway team (Shane Utt, Morgan Foster, Sanjeev Rampal) is **actively building** egress inference support into the OpenShift Gateway (Istio/Envoy). Per the Feb 6 alignment meeting, Shane's team is finalizing the requirements document and building the AuthTokenManagement (ATM) API and controller. This work is complementary to vSR -- the gateway handles **infrastructure plumbing** while vSR handles **routing intelligence**.
 
-Phase 1 is designed to work with either egress model, and to transition seamlessly from one to the other.
+**Phase 1 treats gateway-native egress as the primary path.** vSR-managed egress is the fallback only if the gateway team's timeline slips.
 
 #### Separation of Concerns
 
@@ -855,7 +908,7 @@ vSR continues setting `X-VSR-Model-Selected: bedrock/claude-sonnet` exactly as b
 
 ## 4. Observability Architecture
 
-### 3.1 Prometheus Metrics
+### 4.1 Prometheus Metrics
 
 Phase 1 introduces metrics that capture vSR routing decisions and model token consumption. These metrics serve dual purposes: operational monitoring today, and billing/quota data source for future phases.
 
@@ -952,7 +1005,7 @@ graph LR
 
 **Token capture approach**: vSR's ExtProc response filter parses the `usage` object from the OpenAI-compatible response body. This is already supported by vSR's response filter pipeline -- no new parsing logic is needed. The token counts are emitted as Prometheus counter increments labeled by model and user.
 
-### 3.2 Grafana Dashboard Panels (Recommended)
+### 4.2 Grafana Dashboard Panels (Recommended)
 
 | Panel | Metric Source | Purpose |
 |-------|--------------|---------|
@@ -971,9 +1024,9 @@ graph LR
 
 ---
 
-## 4. Implementation Requirements
+## 5. Implementation Requirements
 
-### 4.1 Component Change Summary
+### 5.1 Component Change Summary
 
 #### RHCL (Kuadrant / Authorino / Limitador) -- No Code Changes
 
@@ -1036,7 +1089,7 @@ These resources are only needed if using vSR-managed egress (Option B fallback):
 | NetworkPolicy (egress) | Allow vSR pods to reach external HTTPS endpoints | 🆕 Configuration |
 | vSR model pool config | Add `credentials_secret` to external endpoint entries | 🆕 Configuration |
 
-### 4.2 Gateway Configuration
+### 5.2 Gateway Configuration
 
 #### HTTPRoute
 
@@ -1075,7 +1128,7 @@ request_headers_to_remove:
   - "x-tier"
 ```
 
-### 4.3 Kubernetes Resources
+### 5.3 Kubernetes Resources
 
 **Option A: Gateway-native egress (preferred)**
 ```
@@ -1127,11 +1180,11 @@ vsr-system namespace:                       # vSR team owns everything
 
 ---
 
-## 5. Error Handling
+## 6. Error Handling
 
 Phase 1 uses standard OpenAI-compatible error responses. Error handling is simpler than v1.0/v1.1 because there are no model constraints or fallback chains.
 
-### 5.1 Error Responses
+### 6.1 Error Responses
 
 **Authentication Failure (Authorino rejects):**
 ```json
@@ -1182,7 +1235,7 @@ HTTP Status: `403 Forbidden`
 ```
 HTTP Status: `503 Service Unavailable`
 
-### 5.2 Error Flow
+### 6.2 Error Flow
 
 ```mermaid
 graph TD
@@ -1210,9 +1263,9 @@ graph TD
 
 ---
 
-## 6. Security Considerations
+## 7. Security Considerations
 
-### 6.1 Trust Boundaries
+### 7.1 Trust Boundaries
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -1230,7 +1283,7 @@ graph TD
 └─────────────────────────────────────────────────────┘
 ```
 
-### 6.2 Phase 1 Security Model
+### 7.2 Phase 1 Security Model
 
 | Threat | Mitigation | Component |
 |--------|-----------|-----------|
@@ -1247,7 +1300,7 @@ graph TD
 | External provider MITM | All egress uses TLS; provider certificates validated by system trust store | Gateway / Envoy TLS |
 | External provider data retention | Out of scope for Phase 1 -- governed by provider contracts (BAA, DPA) | Operational |
 
-### 6.3 Egress Security Controls
+### 7.3 Egress Security Controls
 
 **Option A (Gateway-native egress)** provides the strongest security posture because vSR never touches provider credentials:
 
@@ -1300,7 +1353,7 @@ graph TD
 
 **PII protection for external routing**: This is critical when routing to external providers. The PII detection/redaction step in vSR runs before model selection, which means sensitive data is redacted before it ever leaves the cluster. This applies regardless of which egress model is used -- vSR's PII filter always runs first.
 
-### 6.4 What Phase 1 Does NOT Protect Against
+### 7.4 What Phase 1 Does NOT Protect Against
 
 - **Unauthorized access to specific models**: Any authenticated user with vSR access can potentially be routed to any model in vSR's pool (internal or external). Per-model RBAC is deferred to Phase 2.
 - **Token overconsumption**: No per-model or per-user token quotas are enforced. A user could consume large amounts of tokens within the request rate limit. Prometheus metrics provide visibility but not enforcement.
@@ -1311,9 +1364,9 @@ graph TD
 
 ---
 
-## 7. Deployment Topology
+## 8. Deployment Topology
 
-### 7.1 Namespace Layout
+### 8.1 Namespace Layout
 
 ```mermaid
 graph TB
@@ -1379,7 +1432,7 @@ graph TB
     Prometheus --> Grafana
 ```
 
-### 7.2 vSR Model Pool Configuration
+### 8.2 vSR Model Pool Configuration
 
 In Phase 1, vSR's model pool is configured statically in `config.yaml`. This replaces the dynamic `X-Accessible-Models` approach from v1.1. The configuration supports both internal (KServe) and external (cloud provider) models uniformly.
 
@@ -1393,7 +1446,7 @@ See Section 3.7 for the full configuration example including both internal and e
 
 ---
 
-## 8. Phase 1 to Phase 2 Transition Path
+## 9. Phase 1 to Phase 2 Transition Path
 
 Phase 1 is designed so that every component can be extended without rework when Phase 2 adds per-model authorization and quota enforcement.
 
@@ -1408,25 +1461,99 @@ Phase 1 is designed so that every component can be extended without rework when 
 | External model egress (Option A: gateway / Option B: vSR) | Converge on gateway-native egress; MaaS API manages external provider registry; dynamic provider discovery |
 | Provider-side spending limits only | Per-provider budget enforcement via Limitador + MaaS billing engine |
 | No cost differentiation | Cost-aware routing: vSR considers per-model cost when selecting (internal cheaper than external) |
+| vSR PII/jailbreak plugins (standalone) | Consolidate into shared TrustyAI guardrail framework |
+| MVP providers (OpenAI + Anthropic) | Add Bedrock, Gemini via gateway API translation WASM |
+| Dev preview | Promote to GA based on Phase 1 operational data |
 
 **Data continuity**: The Prometheus metrics collected in Phase 1 (`vsr_tokens_consumed_total` by model, user, tier, provider) provide the historical data needed to configure accurate per-model token quotas and per-provider budgets when Phase 2 launches. This means Phase 1 is not throwaway -- it is the data collection period for Phase 2 policy tuning. The `provider` label on all metrics gives immediate visibility into internal vs. external cost distribution.
 
 ---
 
-## 9. Conclusion
+## 10. Team Responsibilities
 
-Phase 1 delivers a production-ready vSR integration with MaaS by making the minimum viable set of changes:
+Ownership boundaries were established in the Feb 6, 2026 AI Routing alignment meeting. Each team has clear, non-overlapping responsibilities for Phase 1.
+
+### 10.1 Ownership Matrix
+
+| Team | Key People | Phase 1 Responsibilities |
+|------|-----------|-------------------------|
+| **OpenShift Networking / Gateway** | Shane Utt, Morgan Foster | Egress connectivity & trust (ServiceEntry, DestinationRule). AuthTokenManagement (ATM) API + controller for provider credential injection. Higher-level API composing underlying Istio resources. Body-based routing (BBR) primitives at gateway level. API translation WASM plugin for non-OpenAI providers (Bedrock, Gemini -- stretch goal). |
+| **vSR / Semantic Router** | Huamin Chen | ExtProc plugin system: semantic classification, model selection, semantic cache. BBR++ intelligence (semantic classification beyond simple model extraction). Provider adapters for API translation (OpenAI, Anthropic -- vSR has these today). `X-VSR-Model-Selected` + `X-VSR-Provider` + `X-VSR-Category` header injection. Prometheus metric emission (model, provider, tokens, category). Multi-tenant cache namespacing by `X-User-ID`. |
+| **vSR Control Plane** | Ryan Cook | Operator for provisioning and lifecycle management of the semantic router deployment. |
+| **Guardrails / TrustyAI** | Rob (TrustyAI), Shane Utt | Guardrail integration framework with the gateway. Coordinate with vSR team to ensure PII/jailbreak plugins are composable and aligned with the TrustyAI framework. |
+| **MaaS / RHOAI** | Roy Nissim, Noy Itzikowitz | MaaS GA stability -- ensure vSR integration does not disrupt core GA release. AuthPolicy + RateLimitPolicy configuration for vSR access and QoS. Tier resolution endpoint (existing, no changes). Position vSR integration as **dev preview** on top of GA. Customer requirements gathering and MVP prioritization (Wells Fargo). |
+| **Kuadrant / RHCL** | Guilherme Cassolato, Sanjeev Rampal | Authorino configuration for vSR access authentication. Limitador configuration for QoS rate limiting. Source+destination token discrimination (already supported). Validate ATM patterns align with existing Kuadrant capabilities. |
+| **API Translation / Envoy AI GW** | Daniele Zonca | Finalize requirements for API translation layer (OpenAI compatibility, Bedrock/Anthropic format conversion). Advise on WASM plugin vs ExtProc for translation. Composability analysis with Envoy AI Gateway. |
+
+### 10.2 What Each Team Does NOT Own in Phase 1
+
+| Team | Explicitly Out of Scope |
+|------|------------------------|
+| Gateway team | Does NOT do semantic classification, model selection intelligence, or caching |
+| vSR team | Does NOT manage provider credentials or TLS trust (gateway owns that). Does NOT build its own auth framework (reuses Kuadrant). |
+| MaaS team | Does NOT build new API endpoints for Phase 1. Does NOT modify existing GA code paths. |
+| Guardrails/TrustyAI | Does NOT replace vSR's existing PII/jailbreak plugins in Phase 1 -- alignment and consolidation happen in Phase 2 |
+| Kuadrant team | Does NOT build new CRDs -- uses existing AuthPolicy, RateLimitPolicy with new configuration |
+
+### 10.3 Cross-Team Dependencies
+
+```mermaid
+graph LR
+    subgraph "Gateway Team"
+        ATM[AuthTokenManagement API]
+        SE[ServiceEntry config]
+        WASM[API Translation WASM]
+    end
+
+    subgraph "vSR Team"
+        ExtProc[ExtProc plugins]
+        Headers[Header injection]
+        Metrics[Prometheus metrics]
+    end
+
+    subgraph "MaaS Team"
+        AuthP[AuthPolicy config]
+        RLP[RateLimitPolicy config]
+        Preview[Dev preview staging]
+    end
+
+    subgraph "TrustyAI Team"
+        GR[Guardrail framework]
+    end
+
+    subgraph "Kuadrant Team"
+        Auth[Authorino config]
+        Lim[Limitador config]
+    end
+
+    ExtProc -->|X-VSR-Model-Selected| ATM
+    ATM -->|credentials injected| SE
+    AuthP -->|policy targets vSR route| Auth
+    RLP -->|policy targets vSR route| Lim
+    ExtProc -.->|align plugins| GR
+    WASM -.->|stretch goal| ExtProc
+```
+
+**Critical path**: The gateway team's ATM and ServiceEntry work must be ready for vSR to route to external providers. If ATM is delayed, vSR falls back to Option B (self-managed egress with provider adapters).
+
+---
+
+## 11. Conclusion
+
+Phase 1 delivers a **dev preview** of vSR integration with MaaS, staged on top of MaaS GA without impacting its stability:
 
 | Category | Scope |
 |----------|-------|
 | RHCL changes | **Zero** -- configuration only (AuthPolicy + RateLimitPolicy) |
 | MaaS API changes | **Zero** -- reuses existing tier resolution endpoint |
-| vSR changes | **Minimal** -- cache namespacing + header injection + provider adapters + Prometheus metrics |
-| Gateway changes | **Configuration** -- HTTPRoute + header sanitization + ExtProc filter |
-| Egress / External models | **Option A (preferred)**: Gateway team owns egress plumbing; vSR just sets routing headers. **Option B (fallback)**: vSR-managed adapters + Secrets + NetworkPolicy |
+| vSR changes | **Minimal** -- composable plugin pipeline + cache namespacing + header injection + Prometheus metrics |
+| Gateway changes | **Gateway team builds**: ATM, ServiceEntry, egress routing. **Config only for vSR**: HTTPRoute + header sanitization + ExtProc filter |
+| Egress / External models | **Gateway-native** (primary): Gateway team owns egress plumbing; vSR sets routing headers. **vSR-managed** (fallback): vSR adapters + Secrets if gateway is not ready |
+| MVP providers | **OpenAI + Anthropic** (MVP). Bedrock + Gemini (stretch, pending API translation) |
+| Guardrails | vSR PII/jailbreak plugins **aligned with TrustyAI** framework; consolidation in Phase 2 |
 
-The architecture follows a deliberate strategy: **observe before you enforce**. By capturing model selection and token consumption in Prometheus (with `provider` labels distinguishing internal KServe from external AWS Bedrock, OpenAI, etc.) before building enforcement policies, Phase 1 provides real usage data to inform Phase 2's per-model quotas, per-provider budgets, and billing rates.
+The architecture follows a deliberate strategy: **observe before you enforce**. By capturing model selection and token consumption in Prometheus (with `provider` labels distinguishing internal KServe from external OpenAI, Anthropic, etc.) before building enforcement policies, Phase 1 provides real usage data to inform Phase 2's per-model quotas, per-provider budgets, and billing rates.
 
-The egress architecture is designed around a clean separation of concerns: **vSR is the intelligence layer** (classification, model selection, security filtering) and the **OpenShift Gateway is the plumbing layer** (connectivity, credentials, API translation). The [OpenShift Gateway Egress Inference proposal](https://docs.google.com/document/d/1...) (Feb 2026) builds this plumbing directly into the platform, making vSR's job simpler -- it only needs to set a routing header, not manage provider credentials or translate API formats. If the gateway proposal timeline slips, vSR can handle egress directly as a fallback, with a clean transition path to gateway-native egress when it becomes available.
+vSR fills a critical gap that no other component provides today: **body-based routing with semantic intelligence**. The OpenShift Gateway cannot examine request bodies -- it needs vSR (or equivalent) to route OpenAI-compatible requests by model name, classify them semantically, and apply content-level security filters. The gateway and vSR are complementary, not competing: the gateway handles network-level plumbing, vSR handles application-level intelligence.
 
-Phase 1 is not a prototype -- it is the first production layer. Every component deployed in Phase 1 remains in place as Phase 2 adds authorization depth and cost controls on top of it.
+Phase 1 is the first production layer, deployed as a dev preview. Every component remains in place as Phase 2 adds authorization depth, guardrail consolidation, and cost controls on top of it.
