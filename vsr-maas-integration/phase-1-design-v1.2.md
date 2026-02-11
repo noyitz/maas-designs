@@ -43,7 +43,7 @@ This design builds directly on the Egress Inference Support for OpenShift Gatewa
 |------------|-----------|--------|
 | **Connectivity and Trust** | Istio ServiceEntry + DestinationRule. Existing APIs for registering external services, configuring DNS, TLS, mTLS. No new primitives. | Existing in Istio |
 | **Auth Token Management** | New AuthTokenManagement (ATM) API. Source+destination discrimination for credential injection. Built with RHCL/Kuadrant WASM + Authorino, or standalone WASM/dynamic module. | Being built by gateway team |
-| **Inference API Translation** | Middleware to convert OpenAI Chat Completions to provider-native APIs (Bedrock, Anthropic, Gemini). WASM plugin or ExtProc. vSR has this capability today. | TBD -- vSR adapters available now |
+| **Inference API Translation** | Middleware to convert OpenAI Chat Completions to provider-native APIs (Bedrock, Anthropic, Gemini). vSR handles this as part of the BBR plugin using existing adapters for OpenAI and Anthropic. | vSR BBR plugin (MVP: OpenAI, Anthropic) |
 | **Routing** | Header-based routing via HTTPRoute. Body-based routing (BBR) needed to extract model name from JSON payload. vSR provides classification and model selection as a BBR plugin. | vSR plugin extends BBR |
 
 ### 1.1 What the Gateway Provides (No Changes Needed)
@@ -151,7 +151,7 @@ All plugins run **in-process** within the single BBR ExtProc. There is no additi
 
 ### 2.1 vSR as a BBR Guardrail Plugin
 
-The vSR classifier portions are integrated as a `Guardrail`-type BBR plugin inside the IGW's BBR ExtProc. This is **not** the entire vSR deployed as a standalone service -- it is the classifier subsystem (category classification, PII detection, jailbreak detection) extracted as a compiled Go plugin.
+vSR is integrated as a `Guardrail`-type BBR plugin inside the IGW's BBR ExtProc. This is **not** the entire vSR deployed as a standalone service -- it is the classifier subsystem (category classification, PII detection, jailbreak detection) and API translation adapters extracted as a compiled Go plugin.
 
 The plugin implements the GIE `BBRPlugin` interface and runs within the BBR plugin chain:
 
@@ -162,15 +162,16 @@ The plugin implements the GIE `BBRPlugin` interface and runs within the BBR plug
 | Semantic classification (domain, intent, complexity) | No | Yes (ModernBERT via Candle CGO, ~20ms) | Yes |
 | PII detection | No | Yes (ModernBERT token classifier) | Yes |
 | Jailbreak prevention | No | Yes (ModernBERT binary classifier) | Yes |
-| API translation (OpenAI, Anthropic) | No | No (handled at gateway/adapter layer) | Separate |
+| API translation (OpenAI, Anthropic) | No | Yes (existing adapters in `pkg/openai/`, `pkg/anthropic/`) | Yes |
 | Semantic caching | No | No (stays in vSR standalone, not in BBR plugin) | Future |
 
 For the RHOAI 3.4 MVP, the vSR BBR plugin's role is:
+- **API translation** for external providers (OpenAI and Anthropic adapters handle request/response format conversion in-process)
 - **Classification headers** injected into the request for downstream routing decisions
 - **Security filtering** (PII detection, jailbreak prevention) blocking malicious requests before they reach model backends
 - **Model selection** when the client specifies a virtual model like "MoM" (Mixture of Models)
 
-The plugin runs inside the BBR ExtProc process. A single `Execute()` call runs all three classifiers concurrently and returns `X-Gateway-*` headers.
+The plugin runs inside the BBR ExtProc process. A single `Execute()` call runs classification, security checks, and API translation, returning `X-Gateway-*` headers and mutated request bodies as needed.
 
 ### 2.2 Request Flow
 
