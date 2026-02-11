@@ -7,7 +7,7 @@
 **Date**: February 2026
 **Author**: Noy Itzikowitz
 **Release Target**: RHOAI 3.4 Developer Preview
-**MVP Driver**: Wells Fargo -- egress + local model routing
+**MVP Driver**: Customer demand for egress + local model routing
 **Previous Versions**: [v1.0](https://github.com/noyitz/maas-designs) (Dec 2025), [v1.1](https://github.com/noyitz/maas-designs) (Jan 2026)
 
 ---
