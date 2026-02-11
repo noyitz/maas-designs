@@ -18,7 +18,7 @@ This document describes how MaaS is extended to support external model providers
 
 1. **OpenShift Gateway Egress** -- Istio already supports egress via ServiceEntry and DestinationRule. These APIs allow for the explicit registration of external services in the mesh, and for the configuration of connection properties such as DNS resolution, protocols, TLS and mTLS. This design leverages these existing capabilities without introducing new connectivity or trust primitives. An AuthTokenManagement (ATM) layer is added on top to handle provider credential injection (API keys, AWS SigV4, etc.) passively at the gateway.
 
-2. **vSR as a BBR Guardrail Plugin** -- Rather than deploying vSR as a standalone ExtProc, the classifier portions of vSR are extracted and integrated as an in-process Guardrail plugin within the Inference Gateway's (IGW) BBR ExtProc. This leverages the [GIE BBR pluggable framework](https://github.com/kubernetes-sigs/gateway-api-inference-extension/pull/1964) (upstream PRs [#1964](https://github.com/kubernetes-sigs/gateway-api-inference-extension/pull/1964), [#1981](https://github.com/kubernetes-sigs/gateway-api-inference-extension/pull/1981)) to run vSR's classification, PII detection, and jailbreak detection inside the BBR process via a compiled Go plugin. A [POC](https://github.com/vllm-project/semantic-router/pull/889) (tracking [issue #967](https://github.com/vllm-project/semantic-router/issues/967), parent [issue #871](https://github.com/vllm-project/semantic-router/issues/871)) by @abdallahsamabd demonstrates this integration using the `BBRPlugin` interface from GIE. This approach eliminates the extra ExtProc hop, avoids WASM complexity, and prevents double routing.
+2. **vSR as a BBR Plugin in IGW** -- vSR is called as part of the IGW ExtProc in BBR to provide API translation and body-based routing capabilities. The classifier portions of vSR (category classification, PII detection, jailbreak detection) run as an in-process Guardrail plugin within the BBR plugin chain, using the GIE BBR pluggable framework. This eliminates the need for a separate ExtProc hop, avoids WASM complexity, and provides a natural extension point for future body-based capabilities (semantic caching, additional guardrails, advanced classification).
 
 The gateway handles **network plumbing** (egress connectivity, TLS, credentials). The vSR BBR plugin handles **application intelligence** (classification, security filtering, model selection) as part of the BBR plugin chain inside IGW.
 
@@ -37,7 +37,7 @@ The gateway handles **network plumbing** (egress connectivity, TLS, credentials)
 
 ## 1. Foundation: OpenShift Gateway Egress and IGW/GIE Architecture
 
-This design builds directly on the [Egress Inference Support for OpenShift Gateway](https://docs.google.com/document/d/1...) proposal and integrates with the [Inference Gateway (IGW)](https://github.com/kubernetes-sigs/gateway-api-inference-extension) architecture. The gateway proposal provides four capabilities for external services:
+This design builds directly on the Egress Inference Support for OpenShift Gateway proposal and integrates with the Inference Gateway (IGW) architecture. The gateway proposal provides four capabilities for external services:
 
 | Capability | Mechanism | Status |
 |------------|-----------|--------|
@@ -122,7 +122,7 @@ The model name is not in the URL path or headers. Without body-based routing, th
 
 ### 1.4 IGW/GIE and the BBR Plugin Chain
 
-The [Inference Gateway (IGW)](https://github.com/kubernetes-sigs/gateway-api-inference-extension) provides a Body-Based Router (BBR) that runs as an Envoy ExtProc. The BBR pluggable framework ([proposal PR #1964](https://github.com/kubernetes-sigs/gateway-api-inference-extension/pull/1964), [implementation PR #1981](https://github.com/kubernetes-sigs/gateway-api-inference-extension/pull/1981)) allows custom plugins to be compiled into the BBR process and executed as part of a plugin chain.
+The Inference Gateway (IGW) provides a Body-Based Router (BBR) that runs as an Envoy ExtProc. The BBR pluggable framework allows custom plugins to be compiled into the BBR process and executed as part of a plugin chain.
 
 Each plugin implements the `BBRPlugin` interface:
 
@@ -241,7 +241,7 @@ sequenceDiagram
 
 ### 2.4 Request Flow Headers
 
-The vSR BBR plugin uses `X-Gateway-*` headers (per the [POC](https://github.com/vllm-project/semantic-router/pull/889)) rather than custom `X-VSR-*` headers. This aligns with the GIE convention where all BBR plugins contribute to a common gateway header namespace.
+The vSR BBR plugin uses `X-Gateway-*` headers rather than custom `X-VSR-*` headers. This aligns with the GIE convention where all BBR plugins contribute to a common gateway header namespace.
 
 vSR supports two routing modes based on the `model` field in the request body:
 
@@ -297,7 +297,7 @@ HTTP/1.1 200 OK
 {"model": "gpt-4o", "choices": [...], "usage": {"prompt_tokens": 50, "completion_tokens": 200, "total_tokens": 250}}
 ```
 
-**Full header reference (from [POC PR #889](https://github.com/vllm-project/semantic-router/pull/889)):**
+**Full header reference:**
 
 | Header | Description | Example |
 |--------|-------------|---------|
@@ -405,7 +405,7 @@ Rate limits are **request-count-based only** for the MVP. Token-based rate limit
 
 ## 4. BBR Plugin Configuration
 
-The vSR BBR plugin is configured via a ConfigMap mounted into the BBR ExtProc deployment. This follows the pattern established in the [POC deployment YAML](https://github.com/vllm-project/semantic-router/pull/889):
+The vSR BBR plugin is configured via a ConfigMap mounted into the BBR ExtProc deployment:
 
 ```yaml
 apiVersion: v1
@@ -577,7 +577,7 @@ These providers have similar APIs, simple API key authentication, and -- critica
 
 ### 6.2 Future: AWS Bedrock (Not in MVP)
 
-Bedrock is significantly more complex (per Sanjeev Rampal, Feb 6 + Feb 10 meetings) and vSR does not have a Bedrock adapter today:
+Bedrock is significantly more complex and vSR does not have a Bedrock adapter today:
 
 | Aspect | Challenge |
 |--------|-----------|
@@ -614,7 +614,7 @@ gateway namespace (gateway team owns):
 └── Secret: anthropic-credentials        # Anthropic API key
 ```
 
-The BBR ExtProc deployment uses a custom image (`ghcr.io/vllm-project/bbr-with-vsr:latest` per the [POC](https://github.com/vllm-project/semantic-router/pull/889)) that bundles the BBR binary with the vSR Guardrail plugin and ModernBERT classifier models:
+The BBR ExtProc deployment uses a custom image (`ghcr.io/vllm-project/bbr-with-vsr:latest`) that bundles the BBR binary with the vSR Guardrail plugin and ModernBERT classifier models:
 
 ```yaml
 apiVersion: apps/v1
@@ -728,13 +728,13 @@ Key security properties:
 |------|--------------|
 | **Gateway / Networking** | Egress connectivity (ServiceEntry, DestinationRule). AuthTokenManagement API + controller for OpenAI + Anthropic. |
 | **vSR / Semantic Router** | BBR Guardrail plugin: classification, PII detection, jailbreak detection via Candle/ModernBERT CGO bindings. Plugin implements GIE `BBRPlugin` interface. Prometheus metrics from plugin. API translation adapters (OpenAI, Anthropic -- existing). |
-| **IGW / GIE (Nir's team)** | BBR pluggable framework ([PR #1964](https://github.com/kubernetes-sigs/gateway-api-inference-extension/pull/1964), [PR #1981](https://github.com/kubernetes-sigs/gateway-api-inference-extension/pull/1981)). Plugin registry, plugin chain execution, `BBRPlugin` interface stability. |
+| **IGW / GIE** | BBR pluggable framework. Plugin registry, plugin chain execution, `BBRPlugin` interface stability. |
 | **MaaS / RHOAI** | AuthPolicy + RateLimitPolicy configuration. MaaS GA stability (dev preview does not impact GA). |
 | **Kuadrant / RHCL** | Authorino + Limitador configuration for the gateway route. Validate ATM aligns with existing Kuadrant patterns. |
 
 ### Critical Path
 
-1. **GIE BBR pluggable framework** (PRs #1964, #1981) must be merged and stable for the vSR plugin to compile against.
+1. **GIE BBR pluggable framework** must be merged and stable for the vSR plugin to compile against.
 2. The gateway team's ATM and ServiceEntry work must be ready for routing to external providers. If ATM is delayed, the BBR ExtProc can fall back to self-managed egress (mounting provider credential Secrets directly), with a clean transition to gateway-native ATM when available.
 
 ---
@@ -745,16 +745,16 @@ These capabilities extend the architecture but are **not included in the RHOAI 3
 
 | Capability | Architecture | Why Deferred | When |
 |------------|-------------|-------------|------|
-| Semantic cache | Stays in vSR standalone (per Roy Nissim, Feb 10). Not a BBR plugin -- requires persistent state and HNSW index. | Requires classifier models -- not for 3.4 dev preview (per Jessica Forrester, Feb 10) | Post-summit |
-| Additional guardrail plugins | TrustyAI and Nvidia NeMo as separate BBR Guardrail plugins. Each team builds their own `BBRPlugin` implementation, registered in the plugin chain alongside vSR. | Must align with TrustyAI framework (per Ron Haberman, Feb 10). | Post-summit |
+| Semantic cache | Stays in vSR standalone. Not a BBR plugin -- requires persistent state and HNSW index. | Requires classifier models -- not for 3.4 dev preview | Post-summit |
+| Additional guardrail plugins | TrustyAI and Nvidia NeMo as separate BBR Guardrail plugins. Each team builds their own `BBRPlugin` implementation, registered in the plugin chain alongside vSR. | Must align with TrustyAI framework. | Post-summit |
 | Semantic classification | Full 14-domain classification in the BBR plugin. Currently the POC supports a subset of categories. | Requires all ModernBERT classifiers validated in BBR context. | Post-summit |
 | Bedrock / Gemini full support | Complex auth (SigV4) + API translation. Depends on gateway WASM or vSR adapter work. | No vSR adapter today. | 3.5+ |
 | Per-model RBAC | Requires MaaS API `accessible-models` endpoint. | | Phase 2 |
 | Token-based rate limiting | Requires TokenRateLimitPolicy + response body parsing. | | Phase 2 |
 | Billing / cost tracking | Requires metering integration (not a feature of RHAIE today). Prometheus metrics from MVP provide data foundation. | | Phase 3 |
-| Stateful Responses API | Significant complexity (per Jason Greene, Feb 10). Full implementation 12+ months out. | | Future |
+| Stateful Responses API | Significant complexity. Full implementation 12+ months out. | | Future |
 
-### Design Options (from [issue #872](https://github.com/vllm-project/semantic-router/issues/872))
+### Design Options
 
 Two integration approaches are being evaluated:
 
@@ -762,7 +762,7 @@ Two integration approaches are being evaluated:
 
 2. **Entire vSR as plugin**: Make the entire vSR a BBR plugin. This would include the routing engine, adapters, and cache within BBR. More integrated but higher coupling and complexity.
 
-The current design follows option 1. Code commonality between vSR and the BBR plugin is maintained by sharing the classifier interfaces and Candle bindings as Go modules (see [issue #872](https://github.com/vllm-project/semantic-router/issues/872) for design details).
+The current design follows option 1. Code commonality between vSR and the BBR plugin is maintained by sharing the classifier interfaces and Candle bindings as Go modules.
 
 The MVP Prometheus metrics (`bbr_vsr_tokens_consumed_total` by model, user, tier, provider) serve as the data collection period for future billing and quota policy tuning.
 
@@ -780,7 +780,7 @@ The integration is minimal:
 - **Zero MaaS API changes** -- reuses existing tier resolution
 - **Zero new Istio primitives** -- uses existing ServiceEntry + DestinationRule
 - **Single ExtProc** -- vSR runs in-process as a BBR plugin, not as a separate service
-- **Standard GIE interface** -- the vSR plugin implements the upstream `BBRPlugin` interface from the [GIE pluggable framework](https://github.com/kubernetes-sigs/gateway-api-inference-extension/pull/1981)
+- **Standard GIE interface** -- the vSR plugin implements the upstream `BBRPlugin` interface from the GIE pluggable framework
 - **Gateway team builds ATM** -- credential injection for external providers
 
-The architecture supports incremental extension: additional guardrail plugins (TrustyAI, Nvidia NeMo) are added as separate `BBRPlugin` implementations in the same plugin chain. Semantic cache and full vSR routing capabilities remain as standalone components outside BBR, following the principle that the BBR plugin contains only the classifier subsystem (per Roy Nissim, Feb 10).
+The architecture supports incremental extension: additional guardrail plugins (TrustyAI, Nvidia NeMo) are added as separate `BBRPlugin` implementations in the same plugin chain. Semantic cache and full vSR routing capabilities remain as standalone components outside BBR, following the principle that the BBR plugin contains only the classifier subsystem.
