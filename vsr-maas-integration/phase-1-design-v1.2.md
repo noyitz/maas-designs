@@ -120,11 +120,11 @@ POST /v1/chat/completions
 {"model": "gpt-4o", "messages": [{"role": "user", "content": "..."}]}
 ```
 
-The model name is not in the URL path or headers. Without body-based routing, the gateway cannot route this request to the correct backend. This is where the BBR ExtProc -- and the vSR plugin within it -- come in.
+The model name is not in the URL path or headers. Without body-based routing, the gateway cannot route this request to the correct backend. This is where the IGW ExtProc -- and the vSR plugin within its BBR component -- come in.
 
 ### 1.4 IGW/GIE and the BBR Plugin Chain
 
-The Inference Gateway (IGW) provides a Body-Based Router (BBR) that runs as an Envoy ExtProc. The BBR pluggable framework allows custom plugins to be compiled into the BBR process and executed as part of a plugin chain.
+The Inference Gateway (IGW) runs as an Envoy ExtProc. Within IGW, the Body-Based Router (BBR) is the component responsible for parsing request bodies and making routing decisions. The BBR pluggable framework allows custom plugins to be compiled into the IGW process and executed as part of a plugin chain within BBR.
 
 Each plugin implements the `BBRPlugin` interface:
 
@@ -140,12 +140,11 @@ The BBR plugin chain for this design:
 
 | Order | Plugin | Type | Purpose |
 |-------|--------|------|---------|
-| 1 | MetaDataExtractor | Default | Extracts model name from JSON body, promotes to header |
-| 2 | vSR SemanticRouterPlugin | Guardrail | Classification (category/intent), PII detection, jailbreak detection |
-| 3 | *(future)* TrustyAI plugin | Guardrail | Red Hat's AI safety guardrails |
-| 4 | *(future)* Nvidia NeMo plugin | Guardrail | Nvidia guardrails integration |
+| 1 | vSR SemanticRouterPlugin | BBR Plugin | Model extraction from JSON body, API translation, routing header injection |
+| 2 | *(future)* TrustyAI plugin | Guardrail | Red Hat's AI safety guardrails |
+| 3 | *(future)* Nvidia NeMo plugin | Guardrail | Nvidia guardrails integration |
 
-All plugins run **in-process** within the single BBR ExtProc. There is no additional network hop -- the vSR classifier code is compiled directly into the BBR binary via CGO (Candle/ModernBERT Rust bindings called from Go).
+The vSR plugin replaces the default MetaDataExtractor -- it parses the body once and handles both model extraction and API translation in a single pass. All plugins run **in-process** within the IGW ExtProc with no additional network hop.
 
 ---
 
@@ -153,20 +152,22 @@ All plugins run **in-process** within the single BBR ExtProc. There is no additi
 
 ### 2.1 vSR as a BBR Guardrail Plugin
 
-vSR is integrated as a BBR plugin inside the IGW's BBR ExtProc. The plugin provides API translation and body-based routing in the MVP, with the plugin architecture designed to add security filtering and intelligent model selection in future releases.
+vSR is integrated as a BBR plugin inside the IGW ExtProc. The plugin provides API translation and body-based routing in the MVP, with the plugin architecture designed to add security filtering and intelligent model selection in future releases.
 
 The plugin implements the GIE `BBRPlugin` interface and runs within the BBR plugin chain:
 
-| Capability | Default BBR (MetaDataExtractor) | vSR BBR Plugin | Status |
-|------------|--------------------------------|----------------|--------|
-| Extract model name from JSON body | Yes | No (handled by MetaDataExtractor) | MVP |
-| Promote model name to routing header | Yes | No (handled by MetaDataExtractor) | MVP |
-| API translation (OpenAI, Anthropic) | No | Yes (existing adapters in `pkg/openai/`, `pkg/anthropic/`) | MVP |
-| Semantic classification (domain, intent, complexity) | No | Yes (ModernBERT via Candle CGO, ~20ms) | Future |
-| PII detection | No | Yes (ModernBERT token classifier) | Future |
-| Jailbreak prevention | No | Yes (ModernBERT binary classifier) | Future |
-| Intelligent model selection ("MoM") | No | Yes (classification-based routing) | Future |
-| Semantic caching | No | No (stays in vSR standalone, not in BBR plugin) | Future |
+| Capability | vSR BBR Plugin | Status |
+|------------|----------------|--------|
+| Extract model name from JSON body | Yes (single body parse) | MVP |
+| Promote model name to routing header | Yes | MVP |
+| API translation (OpenAI, Anthropic) | Yes (existing adapters in `pkg/openai/`, `pkg/anthropic/`) | MVP |
+| Semantic classification (domain, intent, complexity) | Yes (ModernBERT via Candle CGO, ~20ms) | Future |
+| PII detection | Yes (ModernBERT token classifier) | Future |
+| Jailbreak prevention | Yes (ModernBERT binary classifier) | Future |
+| Intelligent model selection ("MoM") | Yes (classification-based routing) | Future |
+| Semantic caching | No (stays in vSR standalone, not in BBR plugin) | Future |
+
+The vSR plugin replaces the default MetaDataExtractor so the request body is parsed only once. Model extraction, API translation, and (in the future) classification all happen in a single `Execute()` call.
 
 For the RHOAI 3.4 MVP, the vSR BBR plugin's role is:
 - **Body-based model extraction** and header injection for routing
@@ -176,7 +177,7 @@ Future releases will add:
 - **Security filtering** (PII detection, jailbreak prevention) blocking malicious requests before they reach model backends
 - **Model selection** when the client specifies a virtual model like "MoM" (Mixture of Models)
 
-The plugin runs inside the BBR ExtProc process, returning `X-Gateway-*` headers and mutated request bodies as needed.
+The plugin runs inside the IGW ExtProc process as part of BBR, returning `X-Gateway-*` headers and mutated request bodies as needed.
 
 ### 2.2 Request Flow
 
@@ -186,7 +187,7 @@ sequenceDiagram
     participant Gateway as Gateway (Envoy)
     participant Authorino
     participant Limitador
-    participant BBR as BBR ExtProc
+    participant BBR as IGW ExtProc
     participant vSRPlugin as vSR Plugin (in-process)
     participant ATM as AuthTokenManagement
     participant Provider as External Provider (OpenAI)
@@ -201,11 +202,11 @@ sequenceDiagram
 
     Note over Gateway,vSRPlugin: Body-Based Routing (BBR with vSR plugin)
     Gateway->>BBR: ExtProc: request headers + body
-    BBR->>BBR: Plugin 1 (MetaDataExtractor): extract model="gpt-4o"
-    BBR->>vSRPlugin: Plugin 2 (vSR): Execute(body)
+    BBR->>vSRPlugin: vSR plugin: Execute(body)
+    vSRPlugin->>vSRPlugin: Parse body: extract model="gpt-4o"
     vSRPlugin->>vSRPlugin: API translation: format request for OpenAI
     vSRPlugin-->>BBR: Headers: X-Gateway-Model-Name: openai/gpt-4o<br/>Host: api.openai.com
-    BBR-->>Gateway: Combined headers + translated body
+    BBR-->>Gateway: Headers + translated body
 
     Note over Gateway,Provider: Route to external provider (egress)
     Gateway->>ATM: Inject OpenAI credentials
@@ -226,14 +227,14 @@ When the BBR plugin chain routes to an internal model, the flow is simpler -- no
 sequenceDiagram
     participant Client
     participant Gateway as Gateway (Envoy)
-    participant BBR as BBR ExtProc
+    participant BBR as IGW ExtProc
     participant KServe as KServe Model
 
     Client->>Gateway: POST /v1/chat/completions<br/>{"model": "llama3-70b", "messages": [...]}
 
     Note over Gateway,BBR: Auth + QoS already passed
     Gateway->>BBR: ExtProc: request body
-    BBR->>BBR: Plugin 1 (MetaDataExtractor): extract model="llama3-70b"
+    BBR->>BBR: vSR plugin: parse body, extract model="llama3-70b"
     BBR-->>Gateway: X-Gateway-Model-Name: llama3-70b<br/>Host: llama3-70b.model-serving.svc
 
     Gateway->>KServe: Forward request
@@ -245,7 +246,7 @@ sequenceDiagram
 
 The vSR BBR plugin uses `X-Gateway-*` headers rather than custom `X-VSR-*` headers. This aligns with the GIE convention where all BBR plugins contribute to a common gateway header namespace.
 
-In the MVP, the client specifies the model explicitly. The vSR plugin handles API translation for external providers and passes through to internal models.
+In the MVP, the client specifies the model explicitly. The vSR plugin parses the body once, extracts the model name, handles API translation for external providers, and sets routing headers.
 
 **Example A: External provider (OpenAI)**
 
@@ -260,7 +261,7 @@ Content-Type: application/json
 X-User-ID: user-123
 X-Tier: premium
 
-# After BBR ExtProc (MetaDataExtractor + vSR plugin)
+# After IGW ExtProc (vSR plugin in BBR)
 X-Gateway-Model-Name: openai/gpt-4o           # Model resolved from body
 Host: api.openai.com                           # Routing target
 
@@ -281,7 +282,7 @@ Authorization: Bearer sa-token-xyz
 Content-Type: application/json
 {"model": "llama3-70b", "messages": [{"role": "user", "content": "What is the derivative of x²?"}]}
 
-# After BBR ExtProc (MetaDataExtractor resolves model)
+# After IGW ExtProc (vSR plugin in BBR resolves model)
 X-Gateway-Model-Name: llama3-70b              # Internal model
 Host: llama3-70b.model-serving.svc             # Routing target
 
@@ -311,7 +312,7 @@ HTTP/1.1 200 OK
 
 ## 3. Auth and QoS (Existing RHCL -- Configuration Only)
 
-Authentication and rate limiting use existing Kuadrant/RHCL with no code changes. The only change is the policy `targetRef` points to the gateway route that fronts the BBR ExtProc.
+Authentication and rate limiting use existing Kuadrant/RHCL with no code changes. The only change is the policy `targetRef` points to the gateway route that fronts the IGW ExtProc.
 
 ### 3.1 AuthPolicy -- Gateway Access
 
@@ -398,7 +399,7 @@ Rate limits are **request-count-based only** for the MVP. Token-based rate limit
 
 ## 4. BBR Plugin Configuration
 
-The vSR BBR plugin is configured via a ConfigMap mounted into the BBR ExtProc deployment:
+The vSR BBR plugin is configured via a ConfigMap mounted into the IGW ExtProc deployment:
 
 ```yaml
 apiVersion: v1
@@ -467,26 +468,22 @@ endpoints:
   #   model_id: "anthropic.claude-3-5-sonnet-20241022-v2:0"
 ```
 
-When a client sends `{"model": "MoM"}`, the vSR plugin classifies the request, selects the best model from the pool, and sets `X-Gateway-Model-Name` and routing headers accordingly. When a client sends a specific model name like `{"model": "gpt-4o"}`, the MetaDataExtractor plugin handles the model extraction and the vSR plugin runs security checks only. In both cases, the gateway handles egress connectivity and credential injection.
+When a client sends a specific model name like `{"model": "gpt-4o"}`, the vSR plugin extracts the model from the body, handles API translation if needed, and sets routing headers. In future releases, sending `{"model": "MoM"}` will trigger intelligent model selection based on semantic classification. In both cases, the gateway handles egress connectivity and credential injection.
 
 ### 4.2 BBR Plugin Registration
 
 The vSR plugin is registered in the BBR plugin chain at startup. The BBR binary is built with the vSR plugin compiled in:
 
 ```go
-// BBR startup -- register plugin chain
+// BBR startup -- register vSR plugin (replaces default MetaDataExtractor)
 registry := framework.NewPluginRegistry()
 
-// Plugin 1: Default model extraction
-registry.RegisterFactory(bbrplugins.DefaultPluginType, bbrplugins.NewDefaultMetaDataExtractor)
-
-// Plugin 2: vSR semantic router (Guardrail)
+// vSR plugin: model extraction + API translation (single body parse)
 registry.RegisterFactory(plugin.PluginType, plugin.NewSemanticRouterPlugin)
 
 // Build chain
 chain := framework.NewPluginsChain()
-chain.AddPlugin(bbrplugins.DefaultPluginType)  // MetaDataExtractor
-chain.AddPlugin(plugin.PluginType)              // vSR Guardrail
+chain.AddPlugin(plugin.PluginType)  // vSR handles model extraction + API translation
 ```
 
 ---
@@ -495,7 +492,7 @@ chain.AddPlugin(plugin.PluginType)              // vSR Guardrail
 
 ### 5.1 Prometheus Metrics
 
-The vSR BBR plugin emits metrics from within the BBR ExtProc process. Metrics are exposed on the BBR metrics port:
+The vSR BBR plugin emits metrics from within the IGW ExtProc process. Metrics are exposed on the IGW metrics port:
 
 ```yaml
 # Requests processed by vSR BBR plugin
@@ -588,10 +585,10 @@ Bedrock support requires both a new vSR adapter and either the gateway's API Tra
 
 ```
 gateway-system namespace:
-├── Deployment: bbr-extproc              # BBR ExtProc with vSR plugin compiled in
-├── Service: bbr-extproc                 # ClusterIP, port 9002 (gRPC)
-├── Service: bbr-metrics                 # ClusterIP, port 8080
-├── ServiceMonitor: bbr-vsr-metrics      # Prometheus scrape
+├── Deployment: igw-extproc              # IGW ExtProc with vSR plugin compiled into BBR
+├── Service: igw-extproc                 # ClusterIP, port 9002 (gRPC)
+├── Service: igw-metrics                 # ClusterIP, port 8080
+├── ServiceMonitor: igw-vsr-metrics      # Prometheus scrape
 ├── ConfigMap: bbr-vsr-config            # vSR plugin config (classifier, PII, jailbreak thresholds)
 ├── ConfigMap: bbr-model-pool            # Model pool config (endpoints)
 ├── HTTPRoute: inference-route           # Gateway API route
@@ -607,27 +604,27 @@ gateway namespace (gateway team owns):
 └── Secret: anthropic-credentials        # Anthropic API key
 ```
 
-The BBR ExtProc deployment uses a custom image (`ghcr.io/vllm-project/bbr-with-vsr:latest`) that bundles the BBR binary with the vSR Guardrail plugin and ModernBERT classifier models:
+The IGW ExtProc deployment uses a custom image (`ghcr.io/vllm-project/igw-with-vsr:latest`) that bundles IGW with the vSR BBR plugin:
 
 ```yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: bbr-extproc
+  name: igw-extproc
   namespace: gateway-system
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: bbr-extproc
+      app: igw-extproc
   template:
     metadata:
       labels:
-        app: bbr-extproc
+        app: igw-extproc
     spec:
       containers:
-      - name: bbr
-        image: ghcr.io/vllm-project/bbr-with-vsr:latest
+      - name: igw
+        image: ghcr.io/vllm-project/igw-with-vsr:latest
         ports:
         - name: grpc
           containerPort: 9002
@@ -690,11 +687,11 @@ No fallback logic in MVP. If the selected model is unavailable, the request fail
 ```
 UNTRUSTED: Client
   - SA token (validated by Authorino)
-  - Request body (passed to BBR ExtProc)
+  - Request body (passed to IGW ExtProc)
       │
       │ Gateway strips X-Gateway-* from incoming requests
       ▼
-TRUSTED: Internal (BBR ExtProc process)
+TRUSTED: Internal (IGW ExtProc process)
   - X-User-ID, X-Tier (set by Authorino)
   - X-Gateway-Model-Name (set by vSR plugin inside BBR)
   - API translation runs in-process (no network boundary)
@@ -707,9 +704,9 @@ TRUSTED: Egress
 ```
 
 Key security properties:
-- **vSR plugin runs inside the BBR process.** There is no separate service with its own network attack surface. The plugin code runs in the same process as BBR, reducing the trust boundary surface.
-- **No additional network hop.** Unlike a standalone ExtProc, the vSR plugin does not require a separate gRPC connection -- API translation and routing are in-process function calls.
-- **BBR never touches provider credentials.** The gateway's ATM handles credential injection.
+- **vSR plugin runs inside the IGW process.** There is no separate service with its own network attack surface. The plugin code runs in the same process as IGW, reducing the trust boundary surface.
+- **No additional network hop.** Unlike a standalone ExtProc, the vSR plugin does not require a separate gRPC connection -- API translation and routing are in-process function calls within BBR.
+- **IGW never touches provider credentials.** The gateway's ATM handles credential injection.
 - **Provider credentials never reach the client.** ATM replaces the client's SA token with provider credentials at the egress boundary.
 - **Gateway strips `X-Gateway-*` headers** from incoming requests to prevent spoofing.
 
@@ -728,7 +725,7 @@ Key security properties:
 ### Critical Path
 
 1. **GIE BBR pluggable framework** must be merged and stable for the vSR plugin to compile against.
-2. The gateway team's ATM and ServiceEntry work must be ready for routing to external providers. If ATM is delayed, the BBR ExtProc can fall back to self-managed egress (mounting provider credential Secrets directly), with a clean transition to gateway-native ATM when available.
+2. The gateway team's ATM and ServiceEntry work must be ready for routing to external providers. If ATM is delayed, the IGW ExtProc can fall back to self-managed egress (mounting provider credential Secrets directly), with a clean transition to gateway-native ATM when available.
 
 ---
 
@@ -768,13 +765,13 @@ The MVP Prometheus metrics (`bbr_vsr_tokens_consumed_total` by model, user, tier
 This design extends MaaS to support external model providers by composing existing capabilities with the new BBR plugin architecture:
 
 - **Istio egress** (ServiceEntry + DestinationRule) provides connectivity and trust to external services without new primitives
-- **vSR as a BBR plugin** provides API translation and body-based routing inside the IGW's BBR ExtProc -- a single ExtProc call handles model extraction and API translation, with no additional network hop
+- **vSR as a BBR plugin** provides API translation and body-based routing inside the IGW ExtProc -- a single ExtProc call handles model extraction and API translation, with no additional network hop
 
 The integration is minimal:
 - **Zero RHCL code changes** -- AuthPolicy + RateLimitPolicy are configuration only
 - **Zero MaaS API changes** -- reuses existing tier resolution
 - **Zero new Istio primitives** -- uses existing ServiceEntry + DestinationRule
-- **Single ExtProc** -- vSR runs in-process as a BBR plugin, not as a separate service
+- **Single ExtProc** -- vSR runs in-process as a BBR plugin within IGW, not as a separate service
 - **Standard GIE interface** -- the vSR plugin implements the upstream `BBRPlugin` interface from the GIE pluggable framework
 - **Gateway team builds ATM** -- credential injection for external providers
 
