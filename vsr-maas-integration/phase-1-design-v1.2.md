@@ -18,17 +18,19 @@ This document describes how MaaS is extended to support external model providers
 
 1. **OpenShift Gateway Egress** -- Istio already supports egress via ServiceEntry and DestinationRule. These APIs allow for the explicit registration of external services in the mesh, and for the configuration of connection properties such as DNS resolution, protocols, TLS and mTLS. This design leverages these existing capabilities without introducing new connectivity or trust primitives. An AuthTokenManagement (ATM) layer is added on top to handle provider credential injection (API keys, AWS SigV4, etc.) passively at the gateway.
 
-2. **vSR as a BBR Plugin in IGW** -- vSR is called as part of the IGW ExtProc in BBR to provide API translation and body-based routing capabilities. The classifier portions of vSR (category classification, PII detection, jailbreak detection) run as an in-process Guardrail plugin within the BBR plugin chain, using the GIE BBR pluggable framework. This eliminates the need for a separate ExtProc hop, avoids WASM complexity, and provides a natural extension point for future body-based capabilities (semantic caching, additional guardrails, advanced classification).
+2. **vSR as a BBR Plugin in IGW** -- vSR is called as part of the IGW ExtProc in BBR to provide API translation and body-based routing capabilities. The plugin runs in-process within the BBR plugin chain using the GIE BBR pluggable framework. This eliminates the need for a separate ExtProc hop, avoids WASM complexity, and provides a natural extension point for future body-based capabilities (security filtering, intelligent model selection, semantic caching, additional guardrails, advanced classification).
 
-The gateway handles **network plumbing** (egress connectivity, TLS, credentials). The vSR BBR plugin handles **application intelligence** (classification, security filtering, model selection) as part of the BBR plugin chain inside IGW.
+The gateway handles **network plumbing** (egress connectivity, TLS, credentials). The vSR BBR plugin handles **application intelligence** (API translation, body-based routing) as part of the BBR plugin chain inside IGW, with security filtering and intelligent model selection planned for future releases.
 
 **MVP scope for RHOAI 3.4 developer preview:**
 - Egress to **OpenAI and Anthropic** -- these are the providers already supported by vSR with production-ready adapters (`pkg/openai/`, `pkg/anthropic/`)
-- vSR Guardrail plugin for body-based model extraction and routing within BBR
+- vSR BBR plugin for body-based model extraction, API translation, and routing within BBR
 - AuthPolicy + RateLimitPolicy for access control and QoS
 - Prometheus metrics capturing model selection and token usage
 
 **Explicitly out of scope for MVP (per Feb 10 alignment):**
+- Security filtering (PII detection, jailbreak prevention) -- future release
+- Intelligent model selection ("MoM" / Mixture of Models routing) -- future release
 - Semantic cache (stays in vSR standalone -- not for 3.4 dev preview)
 - Per-model RBAC and billing
 - Stateful Responses API support
@@ -151,27 +153,30 @@ All plugins run **in-process** within the single BBR ExtProc. There is no additi
 
 ### 2.1 vSR as a BBR Guardrail Plugin
 
-vSR is integrated as a `Guardrail`-type BBR plugin inside the IGW's BBR ExtProc. This is **not** the entire vSR deployed as a standalone service -- it is the classifier subsystem (category classification, PII detection, jailbreak detection) and API translation adapters extracted as a compiled Go plugin.
+vSR is integrated as a BBR plugin inside the IGW's BBR ExtProc. The plugin provides API translation and body-based routing in the MVP, with the plugin architecture designed to add security filtering and intelligent model selection in future releases.
 
 The plugin implements the GIE `BBRPlugin` interface and runs within the BBR plugin chain:
 
-| Capability | Default BBR (MetaDataExtractor) | vSR BBR Plugin (Guardrail) | Combined |
-|------------|--------------------------------|---------------------------|----------|
-| Extract model name from JSON body | Yes | No (handled by MetaDataExtractor) | Yes |
-| Promote model name to routing header | Yes | No (handled by MetaDataExtractor) | Yes |
-| Semantic classification (domain, intent, complexity) | No | Yes (ModernBERT via Candle CGO, ~20ms) | Yes |
-| PII detection | No | Yes (ModernBERT token classifier) | Yes |
-| Jailbreak prevention | No | Yes (ModernBERT binary classifier) | Yes |
-| API translation (OpenAI, Anthropic) | No | Yes (existing adapters in `pkg/openai/`, `pkg/anthropic/`) | Yes |
+| Capability | Default BBR (MetaDataExtractor) | vSR BBR Plugin | Status |
+|------------|--------------------------------|----------------|--------|
+| Extract model name from JSON body | Yes | No (handled by MetaDataExtractor) | MVP |
+| Promote model name to routing header | Yes | No (handled by MetaDataExtractor) | MVP |
+| API translation (OpenAI, Anthropic) | No | Yes (existing adapters in `pkg/openai/`, `pkg/anthropic/`) | MVP |
+| Semantic classification (domain, intent, complexity) | No | Yes (ModernBERT via Candle CGO, ~20ms) | Future |
+| PII detection | No | Yes (ModernBERT token classifier) | Future |
+| Jailbreak prevention | No | Yes (ModernBERT binary classifier) | Future |
+| Intelligent model selection ("MoM") | No | Yes (classification-based routing) | Future |
 | Semantic caching | No | No (stays in vSR standalone, not in BBR plugin) | Future |
 
 For the RHOAI 3.4 MVP, the vSR BBR plugin's role is:
+- **Body-based model extraction** and header injection for routing
 - **API translation** for external providers (OpenAI and Anthropic adapters handle request/response format conversion in-process)
-- **Classification headers** injected into the request for downstream routing decisions
+
+Future releases will add:
 - **Security filtering** (PII detection, jailbreak prevention) blocking malicious requests before they reach model backends
 - **Model selection** when the client specifies a virtual model like "MoM" (Mixture of Models)
 
-The plugin runs inside the BBR ExtProc process. A single `Execute()` call runs classification, security checks, and API translation, returning `X-Gateway-*` headers and mutated request bodies as needed.
+The plugin runs inside the BBR ExtProc process, returning `X-Gateway-*` headers and mutated request bodies as needed.
 
 ### 2.2 Request Flow
 
@@ -184,9 +189,9 @@ sequenceDiagram
     participant BBR as BBR ExtProc
     participant vSRPlugin as vSR Plugin (in-process)
     participant ATM as AuthTokenManagement
-    participant Provider as External Provider
+    participant Provider as External Provider (OpenAI)
 
-    Client->>Gateway: POST /v1/chat/completions<br/>Authorization: Bearer sa-token<br/>{"model": "MoM", "messages": [{"role": "user", "content": "What is the derivative of x²?"}]}
+    Client->>Gateway: POST /v1/chat/completions<br/>Authorization: Bearer sa-token<br/>{"model": "gpt-4o", "messages": [{"role": "user", "content": "Explain quantum computing"}]}
 
     Note over Gateway,Limitador: Auth + QoS (existing RHCL)
     Gateway->>Authorino: Validate SA token
@@ -196,43 +201,39 @@ sequenceDiagram
 
     Note over Gateway,vSRPlugin: Body-Based Routing (BBR with vSR plugin)
     Gateway->>BBR: ExtProc: request headers + body
-    BBR->>BBR: Plugin 1 (MetaDataExtractor): extract model="MoM"
-    BBR->>vSRPlugin: Plugin 2 (vSR Guardrail): Execute(body)
-    vSRPlugin->>vSRPlugin: Classify: category=mathematics (ModernBERT ~20ms)
-    vSRPlugin->>vSRPlugin: PII check: none detected
-    vSRPlugin->>vSRPlugin: Jailbreak check: safe
-    vSRPlugin-->>BBR: Headers: X-Gateway-Intent-Category: mathematics<br/>X-Gateway-Model-Name: llama3-70b
-    BBR-->>Gateway: Combined headers:<br/>X-Gateway-Intent-Category: mathematics<br/>X-Gateway-Model-Name: llama3-70b<br/>Host: llama3-70b.model-serving.svc
+    BBR->>BBR: Plugin 1 (MetaDataExtractor): extract model="gpt-4o"
+    BBR->>vSRPlugin: Plugin 2 (vSR): Execute(body)
+    vSRPlugin->>vSRPlugin: API translation: format request for OpenAI
+    vSRPlugin-->>BBR: Headers: X-Gateway-Model-Name: openai/gpt-4o<br/>Host: api.openai.com
+    BBR-->>Gateway: Combined headers + translated body
 
-    Note over Gateway,Provider: Route to internal model (no egress needed)
-    Gateway->>Provider: Forward to llama3-70b KServe service
-    Provider-->>Gateway: Response + usage.total_tokens: 170
+    Note over Gateway,Provider: Route to external provider (egress)
+    Gateway->>ATM: Inject OpenAI credentials
+    ATM-->>Gateway: Authorization: Bearer sk-proj-...
+    Gateway->>Provider: Forward to api.openai.com
+    Provider-->>Gateway: Response + usage.total_tokens: 250
 
     Gateway-->>Client: OpenAI-compatible response
 ```
 
-Key difference from the previous design: there is a **single ExtProc call** to BBR. The vSR classification runs in-process as part of the BBR plugin chain -- no second ExtProc hop.
+Key difference from the previous design: there is a **single ExtProc call** to BBR. The vSR API translation runs in-process as part of the BBR plugin chain -- no second ExtProc hop.
 
 ### 2.3 Internal Model Flow (KServe)
 
-When the BBR plugin chain routes to an internal model, the flow is simpler -- no egress or ATM involved:
+When the BBR plugin chain routes to an internal model, the flow is simpler -- no egress, ATM, or API translation involved:
 
 ```mermaid
 sequenceDiagram
     participant Client
     participant Gateway as Gateway (Envoy)
     participant BBR as BBR ExtProc
-    participant vSRPlugin as vSR Plugin (in-process)
     participant KServe as KServe Model
 
     Client->>Gateway: POST /v1/chat/completions<br/>{"model": "llama3-70b", "messages": [...]}
 
-    Note over Gateway,vSRPlugin: Auth + QoS already passed
+    Note over Gateway,BBR: Auth + QoS already passed
     Gateway->>BBR: ExtProc: request body
     BBR->>BBR: Plugin 1 (MetaDataExtractor): extract model="llama3-70b"
-    BBR->>vSRPlugin: Plugin 2 (vSR Guardrail): Execute(body)
-    vSRPlugin->>vSRPlugin: PII check + jailbreak check
-    vSRPlugin-->>BBR: Headers (no classification needed for explicit model)
     BBR-->>Gateway: X-Gateway-Model-Name: llama3-70b<br/>Host: llama3-70b.model-serving.svc
 
     Gateway->>KServe: Forward request
@@ -244,50 +245,23 @@ sequenceDiagram
 
 The vSR BBR plugin uses `X-Gateway-*` headers rather than custom `X-VSR-*` headers. This aligns with the GIE convention where all BBR plugins contribute to a common gateway header namespace.
 
-vSR supports two routing modes based on the `model` field in the request body:
+In the MVP, the client specifies the model explicitly. The vSR plugin handles API translation for external providers and passes through to internal models.
 
-- **`"model": "MoM"` (or `"auto"`)** -- Intelligent routing. The vSR plugin classifies the request semantically and selects the best model. This is the primary use case.
-- **`"model": "gpt-4o"`** -- Pass-through. BBR routes directly to the named model; the vSR plugin still runs PII/jailbreak checks but skips classification.
-
-**Example A: Intelligent routing (primary use case)**
+**Example A: External provider (OpenAI)**
 
 ```http
-# Client Request -- model is "MoM" (Mixture of Models)
-POST /v1/chat/completions
-Authorization: Bearer sa-token-xyz
-Content-Type: application/json
-{"model": "MoM", "messages": [{"role": "user", "content": "What is the derivative of x²?"}]}
-
-# After Auth + QoS (Authorino + Limitador)
-X-User-ID: user-123
-X-Tier: premium
-
-# After BBR ExtProc (MetaDataExtractor + vSR Guardrail plugin)
-X-Gateway-Model-Name: llama3-70b              # vSR selected this based on "mathematics" classification
-X-Gateway-Intent-Category: mathematics         # Semantic classification result
-X-Gateway-Intent-Confidence: 0.9200           # Classification confidence
-X-Gateway-PII-Detected: false                  # No PII found
-X-Gateway-Security-Blocked: false              # No jailbreak detected
-Host: llama3-70b.model-serving.svc             # Routing target
-
-# Response
-HTTP/1.1 200 OK
-{"model": "llama3-70b", "choices": [...], "usage": {"prompt_tokens": 20, "completion_tokens": 150, "total_tokens": 170}}
-```
-
-**Example B: Pass-through to external provider**
-
-```http
-# Client Request -- model is explicitly named
+# Client Request
 POST /v1/chat/completions
 Authorization: Bearer sa-token-xyz
 Content-Type: application/json
 {"model": "gpt-4o", "messages": [{"role": "user", "content": "Explain quantum computing"}]}
 
-# After BBR ExtProc -- pass-through, vSR plugin runs security checks only
-X-Gateway-Model-Name: openai/gpt-4o           # Direct pass-through
-X-Gateway-PII-Detected: false                  # Security check passed
-X-Gateway-Security-Blocked: false              # Security check passed
+# After Auth + QoS (Authorino + Limitador)
+X-User-ID: user-123
+X-Tier: premium
+
+# After BBR ExtProc (MetaDataExtractor + vSR plugin)
+X-Gateway-Model-Name: openai/gpt-4o           # Model resolved from body
 Host: api.openai.com                           # Routing target
 
 # After ATM (gateway injects provider credentials)
@@ -298,22 +272,40 @@ HTTP/1.1 200 OK
 {"model": "gpt-4o", "choices": [...], "usage": {"prompt_tokens": 50, "completion_tokens": 200, "total_tokens": 250}}
 ```
 
-**Full header reference:**
+**Example B: Internal model (KServe)**
 
-| Header | Description | Example |
-|--------|-------------|---------|
-| `X-Gateway-Intent-Category` | Classified category | `mathematics` |
-| `X-Gateway-Intent-Confidence` | Classification confidence (0.0-1.0) | `0.9200` |
-| `X-Gateway-Intent-Latency-Ms` | Classification latency | `18` |
-| `X-Gateway-Model-Name` | Selected model name | `llama3-70b` |
-| `X-Gateway-PII-Detected` | Whether PII was found | `true` / `false` |
-| `X-Gateway-PII-Types` | Types of PII detected | `EMAIL,PHONE` |
-| `X-Gateway-PII-Blocked` | Whether request was blocked due to PII | `true` / `false` |
-| `X-Gateway-PII-Latency-Ms` | PII detection latency | `12` |
-| `X-Gateway-Security-Threat` | Type of security threat detected | `jailbreak` |
-| `X-Gateway-Security-Blocked` | Whether request was blocked | `true` / `false` |
-| `X-Gateway-Security-Confidence` | Jailbreak detection confidence | `0.9700` |
-| `X-Gateway-Security-Latency-Ms` | Jailbreak detection latency | `15` |
+```http
+# Client Request
+POST /v1/chat/completions
+Authorization: Bearer sa-token-xyz
+Content-Type: application/json
+{"model": "llama3-70b", "messages": [{"role": "user", "content": "What is the derivative of x²?"}]}
+
+# After BBR ExtProc (MetaDataExtractor resolves model)
+X-Gateway-Model-Name: llama3-70b              # Internal model
+Host: llama3-70b.model-serving.svc             # Routing target
+
+# Response
+HTTP/1.1 200 OK
+{"model": "llama3-70b", "choices": [...], "usage": {"prompt_tokens": 20, "completion_tokens": 150, "total_tokens": 170}}
+```
+
+**Header reference:**
+
+| Header | Description | Example | Status |
+|--------|-------------|---------|--------|
+| `X-Gateway-Model-Name` | Selected model name | `llama3-70b` | MVP |
+| `X-Gateway-Intent-Category` | Classified category | `mathematics` | Future |
+| `X-Gateway-Intent-Confidence` | Classification confidence (0.0-1.0) | `0.9200` | Future |
+| `X-Gateway-Intent-Latency-Ms` | Classification latency | `18` | Future |
+| `X-Gateway-PII-Detected` | Whether PII was found | `true` / `false` | Future |
+| `X-Gateway-PII-Types` | Types of PII detected | `EMAIL,PHONE` | Future |
+| `X-Gateway-PII-Blocked` | Whether request was blocked due to PII | `true` / `false` | Future |
+| `X-Gateway-PII-Latency-Ms` | PII detection latency | `12` | Future |
+| `X-Gateway-Security-Threat` | Type of security threat detected | `jailbreak` | Future |
+| `X-Gateway-Security-Blocked` | Whether request was blocked | `true` / `false` | Future |
+| `X-Gateway-Security-Confidence` | Jailbreak detection confidence | `0.9700` | Future |
+| `X-Gateway-Security-Latency-Ms` | Jailbreak detection latency | `15` | Future |
 
 ---
 
@@ -681,13 +673,13 @@ Standard OpenAI-compatible error responses:
 |----------|------------|------------|
 | Invalid SA token | 401 | `invalid_api_key` |
 | Rate limit exceeded | 429 | `rate_limit_exceeded` |
-| PII detected (blocked) | 400 | `content_policy_violation` |
-| Jailbreak detected (blocked) | 400 | `content_policy_violation` |
 | External provider error | 502 | `upstream_error` |
 | External provider timeout | 504 | `gateway_timeout` |
 | Model not found in pool | 404 | `model_not_found` |
+| PII detected (blocked) | 400 | `content_policy_violation` | *(future)* |
+| Jailbreak detected (blocked) | 400 | `content_policy_violation` | *(future)* |
 
-When the vSR plugin blocks a request (PII or jailbreak), it returns an error directly from the BBR ExtProc without forwarding to any backend. No fallback logic in MVP. If the selected model is unavailable, the request fails. Intelligent fallback is a future extension.
+No fallback logic in MVP. If the selected model is unavailable, the request fails. Intelligent fallback is a future extension.
 
 ---
 
@@ -704,8 +696,8 @@ UNTRUSTED: Client
       ▼
 TRUSTED: Internal (BBR ExtProc process)
   - X-User-ID, X-Tier (set by Authorino)
-  - X-Gateway-Intent-Category, X-Gateway-Model-Name (set by vSR plugin inside BBR)
-  - PII/jailbreak checks run in-process (no network boundary)
+  - X-Gateway-Model-Name (set by vSR plugin inside BBR)
+  - API translation runs in-process (no network boundary)
       │
       │ ATM injects provider credentials
       ▼
@@ -715,8 +707,8 @@ TRUSTED: Egress
 ```
 
 Key security properties:
-- **vSR plugin runs inside the BBR process.** There is no separate service with its own network attack surface. The classifier code runs in the same process as BBR, reducing the trust boundary surface.
-- **No additional network hop for classification.** Unlike a standalone ExtProc, the vSR plugin does not require a separate gRPC connection -- classification is an in-process function call.
+- **vSR plugin runs inside the BBR process.** There is no separate service with its own network attack surface. The plugin code runs in the same process as BBR, reducing the trust boundary surface.
+- **No additional network hop.** Unlike a standalone ExtProc, the vSR plugin does not require a separate gRPC connection -- API translation and routing are in-process function calls.
 - **BBR never touches provider credentials.** The gateway's ATM handles credential injection.
 - **Provider credentials never reach the client.** ATM replaces the client's SA token with provider credentials at the egress boundary.
 - **Gateway strips `X-Gateway-*` headers** from incoming requests to prevent spoofing.
@@ -728,7 +720,7 @@ Key security properties:
 | Team | Phase 1 Tasks |
 |------|--------------|
 | **Gateway / Networking** | Egress connectivity (ServiceEntry, DestinationRule). AuthTokenManagement API + controller for OpenAI + Anthropic. |
-| **vSR / Semantic Router** | BBR Guardrail plugin: classification, PII detection, jailbreak detection via Candle/ModernBERT CGO bindings. Plugin implements GIE `BBRPlugin` interface. Prometheus metrics from plugin. API translation adapters (OpenAI, Anthropic -- existing). |
+| **vSR / Semantic Router** | BBR plugin: API translation adapters (OpenAI, Anthropic -- existing), body-based model extraction. Plugin implements GIE `BBRPlugin` interface. Prometheus metrics from plugin. Future: classification, PII detection, jailbreak detection via Candle/ModernBERT CGO bindings. |
 | **IGW / GIE** | BBR pluggable framework. Plugin registry, plugin chain execution, `BBRPlugin` interface stability. |
 | **MaaS / RHOAI** | AuthPolicy + RateLimitPolicy configuration. MaaS GA stability (dev preview does not impact GA). |
 | **Kuadrant / RHCL** | Authorino + Limitador configuration for the gateway route. Validate ATM aligns with existing Kuadrant patterns. |
@@ -746,6 +738,8 @@ These capabilities extend the architecture but are **not included in the RHOAI 3
 
 | Capability | Architecture | Why Deferred | When |
 |------------|-------------|-------------|------|
+| Security filtering (PII, jailbreak) | PII detection and jailbreak prevention as part of the vSR BBR plugin. Blocks malicious requests before they reach model backends. | Not critical for MVP -- can be added after initial integration is proven. | Post-summit |
+| Intelligent model selection ("MoM") | Classification-based routing when the client specifies a virtual model. vSR classifies the request and selects the best backend. | Requires classifier models validated in BBR context. Not critical for MVP. | Post-summit |
 | Semantic cache | Stays in vSR standalone. Not a BBR plugin -- requires persistent state and HNSW index. | Requires classifier models -- not for 3.4 dev preview | Post-summit |
 | Additional guardrail plugins | TrustyAI and Nvidia NeMo as separate BBR Guardrail plugins. Each team builds their own `BBRPlugin` implementation, registered in the plugin chain alongside vSR. | Must align with TrustyAI framework. | Post-summit |
 | Semantic classification | Full 14-domain classification in the BBR plugin. Currently the POC supports a subset of categories. | Requires all ModernBERT classifiers validated in BBR context. | Post-summit |
@@ -774,7 +768,7 @@ The MVP Prometheus metrics (`bbr_vsr_tokens_consumed_total` by model, user, tier
 This design extends MaaS to support external model providers by composing existing capabilities with the new BBR plugin architecture:
 
 - **Istio egress** (ServiceEntry + DestinationRule) provides connectivity and trust to external services without new primitives
-- **vSR as a BBR Guardrail plugin** provides semantic classification, PII detection, and jailbreak prevention inside the IGW's BBR ExtProc -- a single ExtProc call handles both model extraction and intelligent routing, with no additional network hop
+- **vSR as a BBR plugin** provides API translation and body-based routing inside the IGW's BBR ExtProc -- a single ExtProc call handles model extraction and API translation, with no additional network hop
 
 The integration is minimal:
 - **Zero RHCL code changes** -- AuthPolicy + RateLimitPolicy are configuration only
@@ -784,4 +778,4 @@ The integration is minimal:
 - **Standard GIE interface** -- the vSR plugin implements the upstream `BBRPlugin` interface from the GIE pluggable framework
 - **Gateway team builds ATM** -- credential injection for external providers
 
-The architecture supports incremental extension: additional guardrail plugins (TrustyAI, Nvidia NeMo) are added as separate `BBRPlugin` implementations in the same plugin chain. Semantic cache and full vSR routing capabilities remain as standalone components outside BBR, following the principle that the BBR plugin contains only the classifier subsystem.
+The architecture supports incremental extension: security filtering (PII, jailbreak), intelligent model selection, and additional guardrail plugins (TrustyAI, Nvidia NeMo) are added in future releases as the BBR plugin matures. Semantic cache and full vSR routing capabilities remain as standalone components outside BBR.
