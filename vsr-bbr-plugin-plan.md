@@ -23,13 +23,22 @@ This plan covers the implementation of a BBR `RequestProcessor` plugin that call
 ### Architecture
 
 ```
-Client --> Istio Gateway --> BBR (ext-proc) --> EPP (ext-proc) --> Model Server
-                              |
-                              |-- vSR plugin (RequestProcessor)
-                              |     calls vSR /v1/route over HTTP
-                              |
-                              +-- [future] api-key injection plugin
+                                        Envoy Gateway (with Istio)
+                                                  |
+                                        ext-proc filter chain
+                                         /                \
+Client --> Istio Gateway ------> BBR (ext-proc #1) --> EPP (ext-proc #2) --> Model Server
+                                    |                   (endpoint picking,
+                                    |                    scheduling)
+                                    |
+                                    |-- vSR plugin (RequestProcessor)
+                                    |     calls vSR /v1/route over HTTP
+                                    |
+                                    +-- [future] api-key injection plugin
 ```
+
+- **BBR** (ext-proc #1): Body-Based Router — runs request plugins (e.g., vSR) to determine the target model and set `X-Gateway-Model-Name` header for Envoy route matching.
+- **EPP** (ext-proc #2): Endpoint Picker — uses the model header to select the optimal backend pod (KV cache locality, load balancing, P/D scheduling).
 
 **Deployment Model**: BBR and vSR run as two containers on the same pod. The vSR plugin calls vSR over localhost HTTP (`http://127.0.0.1:8080`), avoiding network hops.
 
