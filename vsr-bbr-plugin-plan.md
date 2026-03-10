@@ -1,6 +1,6 @@
 # vSR HTTP Plugin for BBR — Implementation Plan
 
-**Authors**: Noy Itzikowitz, Senan Zedan
+**Author**: Noy Itzikowitz
 **Date**: 2026-03-10
 **Workstream**: 5 (Implement vSR plugin and run e2e tests)
 **Reference**: [Pluggable BBR (IGW) + vSR integration doc](https://docs.google.com/document/d/1_pluggable-bbr-vsr-integration)
