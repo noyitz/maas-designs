@@ -16,7 +16,7 @@ This plan covers the implementation of a BBR `RequestProcessor` plugin that call
 | Component | Status |
 |-----------|--------|
 | Upstream GIE pluggable BBR framework (PRs #2369, #2442) | **Merged** into GIE main (March 3-5, 2026) |
-| vSR HTTP API — `POST /v1/route` (Workstream 2) | **Implemented** on branch [`feature/http-routing-api`](https://github.com/noyitz/semantic-router/tree/feature/http-routing-api) & deployed on RHOAI |
+| vSR HTTP API — `POST /v1/route` (Workstream 2) | **Implemented** on branch [`feature/http-routing-api`](https://github.com/noyitz/semantic-router/tree/feature/http-routing-api) & tested locally |
 | vSR plugin for BBR (this plan) | **Not started** |
 | API-key injection plugin (Workstream 4) | Separate follow-up |
 
