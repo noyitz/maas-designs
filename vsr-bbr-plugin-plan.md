@@ -23,22 +23,28 @@ This plan covers the implementation of a BBR `RequestProcessor` plugin that call
 ### Architecture
 
 ```
-                                        Envoy Gateway (with Istio)
-                                                  |
-                                        ext-proc filter chain
-                                         /                \
-Client --> Istio Gateway ------> BBR (ext-proc #1) --> EPP (ext-proc #2) --> Model Server
-                                    |                   (endpoint picking,
-                                    |                    scheduling)
-                                    |
-                                    |-- vSR plugin (RequestProcessor)
-                                    |     calls vSR /v1/route over HTTP
-                                    |
-                                    +-- [future] api-key injection plugin
+                              Envoy Gateway (with Istio)
+                             /            |              \
+                            /             |               \
+                     1. ext-proc     2. ext-proc      3. forward
+                        call            call            request
+                       /                  |                \
+                      v                   v                 v
+                    BBR                  EPP           Model Server
+               (model selection)   (endpoint picking)
+                    |
+                    |-- vSR plugin (RequestProcessor)
+                    |     calls vSR /v1/route over HTTP
+                    |
+                    +-- [future] api-key injection plugin
 ```
 
-- **BBR** (ext-proc #1): Body-Based Router — runs request plugins (e.g., vSR) to determine the target model and set `X-Gateway-Model-Name` header for Envoy route matching.
-- **EPP** (ext-proc #2): Endpoint Picker — uses the model header to select the optimal backend pod (KV cache locality, load balancing, P/D scheduling).
+The Gateway orchestrates calls in a **star topology** (not a chain):
+1. **Gateway -> BBR**: Calls BBR via ext-proc. BBR runs request plugins (e.g., vSR) to determine the target model, sets `X-Gateway-Model-Name` header. Response returns to Gateway.
+2. **Gateway -> EPP**: Calls EPP via ext-proc. EPP uses the model header to select the optimal backend pod (KV cache, load, P/D). Response returns to Gateway.
+3. **Gateway -> Model Server**: Forwards the request to the selected endpoint.
+
+Response flows the reverse path: Model Server -> Gateway -> EPP (response plugins) -> Gateway -> BBR (response plugins) -> Gateway -> Client.
 
 **Deployment Model**: BBR and vSR run as two containers on the same pod. The vSR plugin calls vSR over localhost HTTP (`http://127.0.0.1:8080`), avoiding network hops.
 
@@ -197,9 +203,25 @@ func VSRPluginFactory(name string, rawParams json.RawMessage) (framework.BBRPlug
 }
 ```
 
+**Key assumption**: Model names are globally unique across in-cluster and external models. If a request specifies a specific model name (not `"auto"`), that name unambiguously identifies the target — no vSR routing is needed.
+
 **ProcessRequest** — core logic:
 ```go
+const AutoModelName = "auto"
+
 func (p *VSRPlugin) ProcessRequest(ctx context.Context, req *framework.InferenceRequest) error {
+    // 0. Skip vSR if model is already specified (not "auto")
+    //    Model names are unique — a specific model name means the caller
+    //    already knows the target. Only "auto" requires vSR routing.
+    modelVal, ok := req.Body["model"]
+    if ok {
+        if modelStr, isStr := modelVal.(string); isStr && modelStr != AutoModelName {
+            // Model explicitly set — pass through without calling vSR
+            req.SetHeader("X-Gateway-Model-Name", modelStr)
+            return nil
+        }
+    }
+
     // 1. Build vSR request from req.Body and req.Headers
     vsrReq := buildVSRRequest(req.Body, req.Headers)
 
@@ -269,7 +291,9 @@ func RegisterBBRPlugins() {
 | `X-VSR-Jailbreak-Detected` | `"true"` | Security flag (only set when detected) |
 | `X-VSR-PII-Detected` | `"true"` | Security flag (only set when detected) |
 
-**Body mutation**: `body["model"]` updated from original value (e.g., `"auto"`) to `SelectedModel` from vSR.
+**Body mutation**: `body["model"]` updated from `"auto"` to `SelectedModel` from vSR.
+
+> **Note**: Body mutation support in the upstream pluggable BBR is not yet merged into GIE main (PR in progress by @nirrozenbaum). Header mutations work today. Body mutation will be available shortly — until then, the plugin can be tested with header mutations only.
 
 ---
 
@@ -288,7 +312,8 @@ func RegisterBBRPlugins() {
 
 | Test | Description |
 |------|-------------|
-| `TestProcessRequest_SuccessfulRouting` | Verify `body["model"]` updated and `X-Gateway-Model-Name` set |
+| `TestProcessRequest_SkipWhenModelSpecified` | `model: "gpt-4"` (not "auto") — verify vSR is NOT called, header set to "gpt-4" |
+| `TestProcessRequest_SuccessfulRouting` | `model: "auto"` — verify vSR called, `body["model"]` updated and `X-Gateway-Model-Name` set |
 | `TestProcessRequest_HeadersPassthrough` | Verify incoming headers sent as `metadata.headers` to vSR |
 | `TestProcessRequest_SecurityHeaders` | vSR returns jailbreak=true, verify `X-VSR-Jailbreak-Detected` set |
 | `TestProcessRequest_OptionalFieldsEmpty` | No reasoning_mode, verify no `X-VSR-Reasoning-Mode` header |
@@ -324,6 +349,7 @@ Run tests: `cd llm-d-inference-scheduler && go test ./pkg/bbr/...`
 | # | Scenario | Expected Result |
 |---|----------|-----------------|
 | 1 | `model: "auto"` chat completion | vSR selects model, body.model updated, `X-Gateway-Model-Name` set |
+| 6 | `model: "gpt-4"` (specific model) | vSR skipped, `X-Gateway-Model-Name` set to "gpt-4" directly |
 | 2 | Math question | vSR routes to math-specialized model |
 | 3 | Request with auth headers | `X-Authz-User-Id` forwarded to vSR via metadata.headers |
 | 4 | vSR sidecar down | BBR returns error (503) |
@@ -348,6 +374,7 @@ This is a follow-up integration step after the plugin code itself is written and
 |------|------------|
 | HTTP latency over localhost | vSR typically 10-50ms. Connection pooling + keep-alives minimize overhead. Plan B: in-process vSR calls (separate effort) |
 | Body parsing type assertions | Careful handling of `map[string]any` types from generic JSON unmarshal. Tests cover edge cases. |
+| BBR body mutation not yet in GIE main | Nir is pushing the body mutation PR shortly. Header mutations work today — start testing with headers, add body mutation once merged. |
 | GIE BBR framework API changes | PR #2450 (response plugins) is still draft but doesn't affect RequestProcessor. Monitor for breaking changes. |
 | PR #2413 (import verification) still open | May add constraints on BBR<->EPP imports. Keep `pkg/bbr/` cleanly separated. |
 
