@@ -5,6 +5,7 @@ This repository contains design documents and architectural proposals for the Ma
 ## Design Documents
 
 - [vSR-MaaS Integration](./vsr-maas-integration/README.md) - Integration design for vLLM Semantic Router with Models-as-a-Service platform
+- [Metering & Chargeback Plugin](./metering-chargeback-plugin/design.md) - BBR plugin for token metering, budget enforcement, and chargeback
 
 ## Contributing
 
