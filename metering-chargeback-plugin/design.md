@@ -97,7 +97,6 @@ sequenceDiagram
     Note over MP: Balance OK, allow request
 
     Note over MP: If stream=true:<br/>inject stream_options.include_usage=true
-    Note over MP: Store metadata in<br/>correlationStore[requestId]
 
     MP-->>BBR: nil (success)
     Note over BBR: Run remaining plugins<br/>(translator, key-injection)
@@ -114,8 +113,8 @@ sequenceDiagram
 
     Note over BBR,MP: Response Plugin Chain
     BBR->>MP: ProcessResponse(ctx, response)
+    Note over MP: Read user identity from<br/>response.RequestHeaders
     Note over MP: Extract: prompt_tokens,<br/>completion_tokens from body
-    Note over MP: Look up correlationStore[requestId]<br/>to get userId, group, model
 
     MP-)MS: POST /events (async)<br/>CloudEvents usage event
     Note over MP: Non-blocking, queued<br/>to background worker
@@ -125,7 +124,7 @@ sequenceDiagram
     G-->>C: OpenAI-compatible response
 ```
 
-### Budget Denial Flow
+### Circuit Breaker -- Budget Enforcement Flow
 
 ```mermaid
 sequenceDiagram
@@ -189,33 +188,6 @@ sequenceDiagram
     MP-)MS: POST /events (async)
     MP-->>BBR: nil
     BBR-->>G: Response passthrough
-```
-
-### Correlation Architecture
-
-```mermaid
-graph LR
-    subgraph "Request Phase"
-        RH[Request Headers<br/>X-MaaS-User-Id<br/>X-MaaS-Group<br/>x-request-id] --> Extract[Extract<br/>Metadata]
-        RB[Request Body<br/>model, stream] --> Extract
-        Extract --> Store[correlationStore<br/>map requestId ->metadata]
-    end
-
-    subgraph "Response Phase"
-        ResH[Response Headers<br/>x-request-id echo] --> Lookup[Lookup<br/>Correlation]
-        ResB[Response Body<br/>usage.prompt_tokens<br/>usage.completion_tokens] --> Build[Build<br/>Usage Event]
-        Store -.->|lookup by requestId| Lookup
-        Lookup --> Build
-        Build --> Emit[Async Emit<br/>to OpenMeter]
-    end
-
-    subgraph "Framework Gap 1 (Proposed Fix)"
-        ReqHeaders2[Request Headers<br/>copied to<br/>InferenceResponse.RequestHeaders] -->|Direct access<br/>no correlation needed| Build2[Build<br/>Usage Event]
-        style ReqHeaders2 fill:#9f9,stroke:#333
-        style Build2 fill:#9f9,stroke:#333
-    end
-
-    style Store fill:#ff9,stroke:#333
 ```
 
 ### Metering Event Schema (OpenMeter-compatible)
@@ -339,6 +311,8 @@ Use `context.WithValue` if the framework passes the same `ctx` to both phases.
 
 Implements both `RequestProcessor` and `ResponseProcessor`.
 
+**Prerequisite**: Upstream Gap 1 must be resolved -- the BBR framework must pass request headers to response plugins via `InferenceResponse.RequestHeaders`. This eliminates the need for any in-process correlation store.
+
 ### Configuration
 
 ```json
@@ -365,7 +339,6 @@ graph TB
     subgraph "metering-chargeback plugin"
         Factory[Factory Function] -->|creates| Plugin[MeteringPlugin]
         Plugin -->|owns| HC[HTTP Client<br/>budget checks]
-        Plugin -->|owns| CS[Correlation Store<br/>TTL map, RWMutex<br/>~200 bytes/entry]
         Plugin -->|owns| Emitter[Event Emitter]
         Emitter -->|buffered channel| W1[Worker 1]
         Emitter -->|buffered channel| W2[Worker 2]
@@ -375,12 +348,11 @@ graph TB
         W2 -->|HTTP POST| MS
         W3 -->|HTTP POST| MS
 
-        Plugin -->|ProcessRequest| ReqFlow[Request Flow:<br/>1. Extract metadata<br/>2. Budget check<br/>3. Store correlation<br/>4. Inject stream_options]
+        Plugin -->|ProcessRequest| ReqFlow[Request Flow:<br/>1. Budget check<br/>2. Inject stream_options]
 
-        Plugin -->|ProcessResponse| ResFlow[Response Flow:<br/>1. Extract usage<br/>2. Correlate<br/>3. Queue event]
+        Plugin -->|ProcessResponse| ResFlow[Response Flow:<br/>1. Read RequestHeaders<br/>2. Extract usage<br/>3. Queue event]
     end
 
-    style CS fill:#ff9
     style Emitter fill:#9cf
     style HC fill:#f9f
 ```
@@ -389,74 +361,44 @@ graph TB
 
 ```
 ProcessRequest(ctx, request):
-  1. Extract metadata from headers (lightweight, no body storage):
-     - userId    = request.Headers["X-MaaS-User-Id"]
-     - group     = request.Headers["X-MaaS-Group"]
-     - subscription = request.Headers["X-MaaS-Subscription"]
-     - provider  = request.Headers["X-Gateway-Destination-Provider"]
-     - model     = request.Body["model"]
-     - requestId = request.Headers["x-request-id"] or generate UUID
+  1. Extract model and streaming flag from body:
+     - model      = request.Body["model"]
      - isStreaming = request.Body["stream"] == true
 
   2. Budget check (if enabled):
+     - userId = request.Headers["X-MaaS-User-Id"]
      - HTTP GET to metering system: /subjects/{userId}/balance
      - If balance >= limit --> return error ("budget exhausted")
      - If metering system unreachable and failOpen=true --> allow
      - If metering system unreachable and failOpen=false --> deny
 
-  3. Store metadata for response correlation:
-     - correlationStore[requestId] = {userId, group, model, provider, timestamp}
-     - TTL: 30s default
-
-  4. If streaming:
+  3. If streaming:
      - Inject stream_options.include_usage=true into body
-
-  5. Ensure request ID is in headers for correlation
+     - request.SetBodyField("stream_options", map[string]any{"include_usage": true})
 ```
 
 ### ResponseProcessor Flow
 
+With the upstream Gap 1 fix, response plugins have access to `response.RequestHeaders` -- the original request headers. No correlation store needed.
+
 ```
 ProcessResponse(ctx, response):
-  1. Extract token usage from response body:
-     - OpenAI: usage.prompt_tokens, usage.completion_tokens
+  1. Read user identity from request headers (provided by framework):
+     - userId       = response.RequestHeaders["X-MaaS-User-Id"]
+     - group        = response.RequestHeaders["X-MaaS-Group"]
+     - subscription = response.RequestHeaders["X-MaaS-Subscription"]
+     - provider     = response.RequestHeaders["X-Gateway-Destination-Provider"]
+     - model        = response.Body["model"]
+
+  2. Extract token usage from response body:
+     - OpenAI:    usage.prompt_tokens, usage.completion_tokens
      - Anthropic: usage.input_tokens, usage.output_tokens
 
-  2. Correlate with request metadata:
-     - Look up requestId from response headers or body["id"]
-     - Retrieve from correlationStore
-     - If not found --> emit with partial data (graceful degradation)
-
   3. Build and emit usage event (async):
+     - CloudEvents format with user, group, model, tokens
      - Queue to eventChannel for background emission
-
-  4. Cleanup correlation entry
+     - Background worker: HTTP POST to metering system
 ```
-
-### Correlation Store (In-Process)
-
-```go
-type correlationEntry struct {
-    UserID       string
-    Group        string
-    Subscription string
-    Model        string
-    Provider     string
-    Timestamp    time.Time
-    IsStreaming   bool
-}
-
-type correlationStore struct {
-    mu      sync.RWMutex
-    entries map[string]correlationEntry  // keyed by request ID
-    ttl     time.Duration
-}
-```
-
-- Entries are small (~200 bytes each) -- no body storage
-- TTL-based cleanup goroutine evicts stale entries
-- Bounded map size with eviction when full
-- Thread-safe with RWMutex
 
 ### Async Event Emission
 
@@ -487,54 +429,35 @@ type eventEmitter struct {
 
 ---
 
-## File Structure
-
-```
-ai-gateway-payload-processing/
-  pkg/plugins/
-    metering_chargeback/
-      plugin.go              # Plugin struct, factory, ProcessRequest, ProcessResponse
-      correlation.go         # In-process correlation store with TTL
-      emitter.go             # Async event emitter with buffered channel
-      budget.go              # Budget check HTTP client
-      providers/
-        openmeter.go         # OpenMeter-specific event format and API client
-        openmeter_test.go
-      tests/
-        plugin_test.go
-```
-
----
-
 ## Delivery Phases
 
 ```mermaid
 gantt
     title Metering Plugin Delivery
     dateFormat YYYY-MM-DD
+    section Prerequisites
+        Upstream PR request headers in response  :crit, g1, 2026-03-18, 7d
     section Phase 1 - Non-Streaming Metering
-        Upstream Gap 1 PR (request headers)    :crit, g1, 2026-03-18, 7d
-        Plugin skeleton + correlation store     :p1a, 2026-03-18, 5d
-        OpenMeter event emission               :p1b, after p1a, 5d
-        Unit tests                             :p1c, after p1b, 3d
+        Plugin skeleton + async emitter          :p1a, after g1, 5d
+        OpenMeter event emission                 :p1b, after p1a, 5d
+        Unit tests                               :p1c, after p1b, 3d
     section Phase 2 - Budget Enforcement
-        Budget check HTTP client               :p2a, after p1b, 5d
-        Circuit breaker logic                  :p2b, after p2a, 3d
-        Upstream Gap 2 issue (429 responses)   :g2, after p2a, 3d
+        Budget check HTTP client                 :p2a, after p1b, 5d
+        Circuit breaker logic                    :p2b, after p2a, 3d
+        Upstream Gap 2 issue (429 responses)     :g2, after p2a, 3d
     section Phase 3 - Streaming
-        Inject stream_options in request       :p3a, after p2b, 3d
-        Upstream Gap 3 (SSE parsing)           :g3, after p3a, 14d
-        Streaming response extraction          :p3b, after g3, 5d
+        Inject stream_options in request         :p3a, after p2b, 3d
+        Upstream Gap 3 (SSE parsing)             :g3, after p3a, 14d
+        Streaming response extraction            :p3b, after g3, 5d
     section Phase 4 - Advanced
-        Per-model pricing                      :p4a, after p3b, 7d
-        Grafana dashboard                      :p4b, after p4a, 5d
+        Per-model pricing                        :p4a, after p3b, 7d
+        Grafana dashboard                        :p4b, after p4a, 5d
 ```
 
 ### Phase 1: Non-Streaming Metering (P0)
-- RequestProcessor: extract user/group/model, correlation store
-- ResponseProcessor: extract token usage, emit async event
+- ResponseProcessor: read user identity from `response.RequestHeaders`, extract token usage, emit async event
 - OpenMeter integration (CloudEvents format)
-- Requires: upstream Gap 1 fix (or workaround)
+- Requires: upstream Gap 1 merged
 
 ### Phase 2: Budget Enforcement (P0)
 - Pre-flight HTTP callout to metering system
