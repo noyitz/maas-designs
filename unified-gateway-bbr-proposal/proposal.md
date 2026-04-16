@@ -55,11 +55,11 @@ graph LR
 
 A natural thought: swap BBR and Kuadrant so BBR runs first, extracts the model from the body, and Kuadrant can use it. **This doesn't work** because:
 
-1. **api-translation replaces the user's API key** with the provider's API key. If Kuadrant runs after BBR, it sees the provider key (`sk-ant-...`) instead of the user key (`sk-oai-...`). Auth and rate limiting break — Kuadrant can't identify the user.
+1. **Heavy payload processing should only run after auth passes.** api-translation, apikey-injection, and provider-resolver do significant work (external CRD lookups, request body transformation, secret access). Running these before auth means unauthenticated requests consume resources unnecessarily.
 
-2. **Heavy payload processing should only run after auth passes.** api-translation, apikey-injection, and provider-resolver do significant work (external CRD lookups, request body transformation, secret access). Running these before auth means unauthenticated requests consume resources unnecessarily.
+2. **Some payload plugins depend on auth data.** For example, subscription-based routing and metering need to know the user identity, which comes from the auth step.
 
-3. **Some payload plugins depend on auth data.** For example, subscription-based routing and metering need to know the user identity, which comes from the auth step.
+3. **For external models, api-translation replaces the user's API key** with the provider's API key. If Kuadrant runs after BBR, it sees the provider key (`sk-ant-...`) instead of the user key (`sk-oai-...`). Auth and rate limiting break — Kuadrant can't identify the user.
 
 ### Why the Lightweight ext_proc Approach Ends Up with 3 Hops
 
