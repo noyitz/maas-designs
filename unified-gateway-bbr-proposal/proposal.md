@@ -34,28 +34,70 @@ The core idea: **BBR becomes the single orchestration layer**, with auth and rat
 
 ### The Unified Entry Point Challenge
 
-Today, model inference requests include the model name in the URL path:
+Today, model inference requests include the **model name** and **namespace** in the URL path:
 
 ```
-POST https://maas.example.com/llm/granite-3b/v1/chat/completions
+POST https://maas.example.com/ llm / granite-3b /v1/chat/completions
+                                ^^^   ^^^^^^^^^^
+                            namespace  model name
 ```
 
-Industry standard (OpenAI-compatible) APIs use a single endpoint with the model in the request body:
+Industry standard (OpenAI-compatible) APIs use a single endpoint with the model in the **request body**:
 
 ```
 POST https://maas.example.com/v1/chat/completions
 Body: {"model": "granite-3b", "messages": [...]}
 ```
 
-Removing the model from the path breaks the current architecture because:
+To align with industry standards (RHAIRFE-1304), we need to remove the model from the URL path.
 
-1. **Kuadrant's WasmPlugin cannot read the request body** — it only sees headers and path
-2. **Per-model HTTPRoutes can't match** — path-based routing no longer works
-3. **Per-model Kuadrant policies lose their target** — AuthPolicy and TokenRateLimitPolicy target specific HTTPRoutes
+### Why This Breaks the Current Architecture
+
+The root cause is **filter ordering in Envoy**. Today, the Kuadrant WasmPlugin (auth + rate limiting) runs as the **first filter**, before BBR (payload processing). Kuadrant uses the model name from the URL path to determine which AuthPolicy and TokenRateLimitPolicy apply to the request. **Kuadrant's WasmPlugin cannot read the request body** — it only sees headers and the path. If the model is no longer in the path, Kuadrant has no way to identify which model the request targets, and per-model auth and rate-limiting break.
+
+```
+Today's filter chain:
+
+  ┌─────────────────────────────┐     ┌────────────────────────────┐
+  │ Filter 1: Kuadrant WasmPlugin│     │ Filter 2: BBR ext_proc     │
+  │                             │     │                            │
+  │ - Reads model from PATH     │     │ - Reads model from BODY    │
+  │ - Calls Authorino (auth)    │ ──► │ - body-field-to-header     │
+  │ - Calls Limitador (rate)    │     │ - provider-resolver        │
+  │                             │     │ - api-translation          │
+  │ ⚠ CANNOT read request body  │     │ - apikey-injection         │
+  └─────────────────────────────┘     └────────────────────────────┘
+
+  If model is removed from path → Kuadrant can't identify the model → auth/rate-limit break
+```
+
+### Why We Can't Simply Swap the Filter Order
+
+A natural thought: swap BBR and Kuadrant so BBR runs first, extracts the model from the body, and Kuadrant can use it. **This doesn't work** because:
+
+1. **api-translation replaces the user's API key** with the provider's API key. If Kuadrant runs after BBR, it sees the provider key (`sk-ant-...`) instead of the user key (`sk-oai-...`). Auth and rate limiting break — Kuadrant can't identify the user.
+
+2. **Heavy payload processing should only run after auth passes.** api-translation, apikey-injection, and provider-resolver do significant work (external CRD lookups, request body transformation, secret access). Running these before auth means unauthenticated requests consume resources unnecessarily.
+
+3. **Some payload plugins depend on auth data.** For example, subscription-based routing and metering need to know the user identity, which comes from the auth step.
+
+### Why the Lightweight ext_proc Approach Ends Up with 3 Hops
+
+The proposed workaround is to split BBR: put a lightweight ext_proc **before** Kuadrant that only does `body-field-to-header` (extract model from body → inject as header). Then Kuadrant can read the model from the header.
+
+However, this results in **three separate Envoy filters**:
+
+```
+Filter 1: ext_proc (lightweight)    →  gRPC hop to lightweight BBR service
+Filter 2: WasmPlugin (Kuadrant)     →  in-process WASM + gRPC to Authorino + gRPC to Limitador
+Filter 3: ext_proc (BBR)            →  gRPC hop to BBR service (remaining plugins)
+```
+
+Three filters, two ext_proc services to deploy, and the tight Kuadrant coupling remains unchanged. This solves the immediate unified-entry-point problem but does not address the underlying architectural constraints.
 
 ### The Tight Coupling Problem
 
-The current architecture has three layers of indirection:
+Beyond the unified entry point, the current architecture has three layers of CRD indirection:
 
 ```
 MaaSAuthPolicy → MaaS Controller → Kuadrant AuthPolicy → Kuadrant Operator → Authorino AuthConfig
@@ -65,12 +107,69 @@ MaaSSubscription → MaaS Controller → Kuadrant TRLP → Kuadrant Operator →
 This coupling introduces:
 - **Deployment complexity** — Kuadrant operator requires CSV patching for OpenShift Gateway controller recognition, race conditions with `MissingDependency` status
 - **Architectural constraints** — WasmPlugin can't see request body, forcing model-in-path pattern
-- **Limited pluggability** — auth and rate-limiting are locked to Authorino and Limitador via Kuadrant's CRDs
+- **Limited pluggability** — auth and rate-limiting are locked to Authorino and Limitador via Kuadrant's CRDs; no path to swap auth backends or replace Limitador with a metering system
 - **Multiple Envoy filters** — WasmPlugin + ext_proc adds latency and operational complexity
+- **Duplicate body opening** — Limitador's TokenRateLimitPolicy opens the response body to extract token counts, while BBR also opens the response body for api-translation. Two separate components parsing the same body
 
 ---
 
 ## Architecture Comparison
+
+### Side-by-Side Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ Approach A: Current (2 filters, tight Kuadrant coupling)                        │
+│                                                                                 │
+│   WasmPlugin (Kuadrant)              ext_proc (BBR)                             │
+│   ┌─────────────────────┐            ┌──────────────────────┐                   │
+│   │ WASM binary          │            │ body-field-to-header  │                   │
+│   │  → Authorino gRPC    │     ──►    │ provider-resolver     │                   │
+│   │  → Limitador gRPC    │            │ api-translation       │                   │
+│   │                      │            │ apikey-injection       │                   │
+│   │ ⚠ Can't see body     │            │                       │                   │
+│   └─────────────────────┘            └──────────────────────┘                   │
+│        filter 1                           filter 2                              │
+│                                                                                 │
+│   ⚠ Model MUST be in URL path. Kuadrant reads it from the path.                │
+│   ⚠ Per-model HTTPRoutes required for policy targeting.                         │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ Approach B: Lightweight ext_proc before Kuadrant (3 filters)                    │
+│                                                                                 │
+│   ext_proc (lightweight)   WasmPlugin (Kuadrant)    ext_proc (BBR)              │
+│   ┌───────────────────┐   ┌─────────────────────┐  ┌──────────────────────┐     │
+│   │ body-field-to-     │   │ WASM binary          │  │ provider-resolver     │     │
+│   │ header             │ ► │  → Authorino gRPC    │► │ api-translation       │     │
+│   │                    │   │  → Limitador gRPC    │  │ apikey-injection       │     │
+│   │ (model → header)   │   │                      │  │                       │     │
+│   └───────────────────┘   └─────────────────────┘  └──────────────────────┘     │
+│        filter 1                filter 2                 filter 3                │
+│                                                                                 │
+│   ⚠ 3 filters, 2 ext_proc services. Kuadrant coupling remains.                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ Approach C: Unified BBR Pipeline (this proposal — 1 filter, pluggable)          │
+│                                                                                 │
+│   ext_proc (BBR — single entry point)                                           │
+│   ┌────────────────────────────────────────────────────────────────────┐         │
+│   │ 1. body-field-to-header                                            │         │
+│   │ 2. auth-plugin → Authorino gRPC          ← plugin, swappable      │         │
+│   │ 3. rate-limit-plugin → Limitador gRPC    ← plugin, swappable      │         │
+│   │ 4. model-provider-resolver                                         │         │
+│   │ 5. api-translation                                                 │         │
+│   │ 6. apikey-injection                                                │         │
+│   └────────────────────────────────────────────────────────────────────┘         │
+│        single filter, single gRPC hop                                           │
+│                                                                                 │
+│   ✓ No Kuadrant dependency. Auth + rate-limit as swappable BBR plugins.         │
+│   ✓ Model read from body natively. No model in path required.                   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
 
 ### Approach A: Current Architecture (Today)
 
