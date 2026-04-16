@@ -55,21 +55,34 @@ To align with industry standards (RHAIRFE-1304), we need to remove the model fro
 
 The root cause is **filter ordering in Envoy**. Today, the Kuadrant WasmPlugin (auth + rate limiting) runs as the **first filter**, before BBR (payload processing). Kuadrant uses the model name from the URL path to determine which AuthPolicy and TokenRateLimitPolicy apply to the request. **Kuadrant's WasmPlugin cannot read the request body** — it only sees headers and the path. If the model is no longer in the path, Kuadrant has no way to identify which model the request targets, and per-model auth and rate-limiting break.
 
-```
-Today's filter chain:
+```mermaid
+graph LR
+    subgraph envoy["Envoy Gateway (in-process filter chain)"]
+        direction LR
+        subgraph f1["Filter 1: Kuadrant WasmPlugin"]
+            direction TB
+            A1["- Reads model from PATH"]
+            A2["- Calls Authorino (auth)"]
+            A3["- Calls Limitador (rate)"]
+            A4["⚠ CANNOT read request body"]
+            A1 --- A2 --- A3 --- A4
+        end
+        subgraph f2["Filter 2: BBR ext_proc"]
+            direction TB
+            B1["- Reads model from BODY"]
+            B2["- body-field-to-header"]
+            B3["- provider-resolver"]
+            B4["- api-translation"]
+            B5["- apikey-injection"]
+            B1 --- B2 --- B3 --- B4 --- B5
+        end
+        f1 -->|in-process| f2
+    end
 
-  ┌─────────────────────────────┐     ┌────────────────────────────┐
-  │ Filter 1: Kuadrant WasmPlugin│     │ Filter 2: BBR ext_proc     │
-  │                             │     │                            │
-  │ - Reads model from PATH     │     │ - Reads model from BODY    │
-  │ - Calls Authorino (auth)    │ ──► │ - body-field-to-header     │
-  │ - Calls Limitador (rate)    │     │ - provider-resolver        │
-  │                             │     │ - api-translation          │
-  │ ⚠ CANNOT read request body  │     │ - apikey-injection         │
-  └─────────────────────────────┘     └────────────────────────────┘
-
-  If model is removed from path → Kuadrant can't identify the model → auth/rate-limit break
+    style A4 fill:#553333,color:#ff9999
 ```
+
+> If model is removed from path → Kuadrant can't identify the model → auth/rate-limit break
 
 ### Why We Can't Simply Swap the Filter Order
 
@@ -121,25 +134,27 @@ This coupling introduces:
 
 ```mermaid
 graph LR
-    subgraph filter1["Filter 1: WasmPlugin (Kuadrant)"]
-        direction TB
-        W1["WASM binary"]
-        W2["→ Authorino gRPC"]
-        W3["→ Limitador gRPC"]
-        W4["⚠ Can't see body"]
-        W1 --- W2 --- W3 --- W4
+    subgraph envoy["Envoy Gateway"]
+        direction LR
+        subgraph filter1["Filter 1: WasmPlugin — Kuadrant"]
+            direction TB
+            W1["WASM binary (in-process)"]
+            W2["→ Authorino gRPC"]
+            W3["→ Limitador gRPC"]
+            W4["⚠ Can't see body"]
+            W1 --- W2 --- W3 --- W4
+        end
+        subgraph filter2["Filter 2: ext_proc — BBR"]
+            direction TB
+            B1["body-field-to-header"]
+            B2["provider-resolver"]
+            B3["api-translation"]
+            B4["apikey-injection"]
+            B1 --- B2 --- B3 --- B4
+        end
+        filter1 -->|in-process| filter2
     end
-
-    subgraph filter2["Filter 2: ext_proc (BBR)"]
-        direction TB
-        B1["body-field-to-header"]
-        B2["provider-resolver"]
-        B3["api-translation"]
-        B4["apikey-injection"]
-        B1 --- B2 --- B3 --- B4
-    end
-
-    filter1 -->|gRPC hop| filter2
+    filter2 -.->|gRPC| ExtBBR["BBR Service<br/>port 9004"]
 
     style W4 fill:#553333,color:#ff9999
 ```
@@ -151,48 +166,54 @@ graph LR
 
 ```mermaid
 graph LR
-    subgraph filter1["Filter 1: ext_proc (lightweight)"]
-        direction TB
-        L1["body-field-to-header"]
-        L2["(model → header)"]
-        L1 --- L2
+    subgraph envoy["Envoy Gateway"]
+        direction LR
+        subgraph filter1["Filter 1: ext_proc — lightweight"]
+            direction TB
+            L1["body-field-to-header"]
+            L2["(model → header)"]
+            L1 --- L2
+        end
+        subgraph filter2["Filter 2: WasmPlugin — Kuadrant"]
+            direction TB
+            W1["WASM binary (in-process)"]
+            W2["→ Authorino gRPC"]
+            W3["→ Limitador gRPC"]
+            W1 --- W2 --- W3
+        end
+        subgraph filter3["Filter 3: ext_proc — BBR"]
+            direction TB
+            B1["provider-resolver"]
+            B2["api-translation"]
+            B3["apikey-injection"]
+            B1 --- B2 --- B3
+        end
+        filter1 -->|in-process| filter2 -->|in-process| filter3
     end
-
-    subgraph filter2["Filter 2: WasmPlugin (Kuadrant)"]
-        direction TB
-        W1["WASM binary"]
-        W2["→ Authorino gRPC"]
-        W3["→ Limitador gRPC"]
-        W1 --- W2 --- W3
-    end
-
-    subgraph filter3["Filter 3: ext_proc (BBR)"]
-        direction TB
-        B1["provider-resolver"]
-        B2["api-translation"]
-        B3["apikey-injection"]
-        B1 --- B2 --- B3
-    end
-
-    filter1 -->|gRPC hop| filter2 -->|gRPC hop| filter3
+    filter1 -.->|gRPC| ExtLight["Lightweight BBR Service"]
+    filter3 -.->|gRPC| ExtBBR["BBR Service<br/>port 9004"]
 ```
 
-> **⚠ 3 filters, 2 ext_proc services to deploy.** Kuadrant coupling remains unchanged.
+> **⚠ 3 filters, 2 ext_proc services to deploy, 2 gRPC hops.** Kuadrant coupling remains unchanged.
 
 #### Approach C: Unified BBR Pipeline (this proposal — 1 filter, pluggable)
 
 ```mermaid
 graph LR
-    subgraph filter1["Single Filter: ext_proc (BBR — single entry point)"]
-        direction TB
-        P1["1. body-field-to-header"]
-        P2["2. auth-plugin → Authorino gRPC — <i>plugin, swappable</i>"]
-        P3["3. rate-limit-plugin → Limitador gRPC — <i>plugin, swappable</i>"]
-        P4["4. model-provider-resolver"]
-        P5["5. api-translation"]
-        P6["6. apikey-injection"]
-        P1 --> P2 --> P3 --> P4 --> P5 --> P6
+    subgraph envoy["Envoy Gateway"]
+        direction LR
+        subgraph filter1["Single Filter: ext_proc — BBR"]
+            direction TB
+            P1["1. body-field-to-header"]
+            P2["2. auth-plugin → Authorino gRPC — swappable"]
+            P3["3. rate-limit-plugin → Limitador gRPC — swappable"]
+            P4["4. model-provider-resolver"]
+            P5["5. api-translation"]
+            P6["6. apikey-injection"]
+            P1 --> P2 --> P3 --> P4 --> P5 --> P6
+        end
     end
+    filter1 -.->|single gRPC hop| ExtBBR["BBR Service<br/>port 9004"]
 
     style filter1 fill:#1a3320,color:#88cc88
 ```
