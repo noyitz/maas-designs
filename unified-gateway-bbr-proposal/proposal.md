@@ -2,7 +2,7 @@
 
 **Date:** April 15, 2026
 **Status:** Draft / RFC
-**Tracker:** RHAIRFE-1304 (Unified Entry Point)
+**Tracker:** [RHAIRFE-1304](https://redhat.atlassian.net/browse/RHAIRFE-1304) (Unified Entry Point)
 
 ---
 
