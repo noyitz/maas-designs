@@ -7,7 +7,7 @@
 
 ## Executive Summary
 
-This proposal introduces an alternative approach to the unified entry point ([RHAIRFE-1304](https://redhat.atlassian.net/browse/RHAIRFE-1304)) that decouples the gateway flow from the tight integration with RHCL/Kuadrant. Instead of adding a third Envoy filter to work around Kuadrant's limitations, we consolidate the entire request lifecycle — authentication, rate limiting, and payload processing — into a single BBR ext_proc pipeline with pluggable plugins.
+This proposal introduces an alternative approach to the unified entry point ([RHAIRFE-1304](https://redhat.atlassian.net/browse/RHAIRFE-1304)). Instead of adding a third Envoy filter to work around the current limitation of having the model name in the URL path, we consolidate the entire request lifecycle — authentication, rate limiting, and payload processing — into a single BBR ext_proc pipeline with pluggable plugins.
 
 The core idea: **BBR becomes the single orchestration layer**, with auth and rate-limiting as swappable plugins that call Kuadrant's core components (Authorino, Limitador) directly via gRPC. This decouples the gateway flow from the Kuadrant operator's orchestration layer (WasmPlugin, CRD translation) while preserving Kuadrant's proven auth and rate-limiting backends — and enabling future pluggability.
 
