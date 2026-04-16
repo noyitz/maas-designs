@@ -61,11 +61,11 @@ A natural thought: swap BBR and Kuadrant so BBR runs first, extracts the model f
 
 3. **For external models, api-translation replaces the user's API key** with the provider's API key. If Kuadrant runs after BBR, it sees the provider key (`sk-ant-...`) instead of the user key (`sk-oai-...`). Auth and rate limiting break — Kuadrant can't identify the user.
 
-### Why the Lightweight ext_proc Approach Ends Up with 3 Hops
+### Why Splitting BBR Into Lightweight + Heavy Doesn't Scale
 
-The proposed workaround is to split BBR: put a lightweight ext_proc **before** Kuadrant that only does `body-field-to-header` (extract model from body → inject as header). Then Kuadrant can read the model from the header.
+Since we can't swap the filter order, another approach is to split the BBR plugin chain in two: take the `body-field-to-header` plugin out of BBR and deploy it as a separate lightweight ext_proc that runs **before** Kuadrant. This lightweight ext_proc would extract the model from the request body and inject it as a header, so Kuadrant can see it. The remaining "heavy" BBR plugins (provider-resolver, api-translation, apikey-injection) stay as a second ext_proc **after** Kuadrant.
 
-However, this results in **three separate Envoy filters**:
+While this solves the immediate problem, it introduces a new one — **three separate Envoy filters**:
 
 ```
 Filter 1: ext_proc (lightweight)    →  gRPC hop to lightweight BBR service
