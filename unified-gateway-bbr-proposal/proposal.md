@@ -73,7 +73,7 @@ Filter 2: WasmPlugin (Kuadrant)     →  in-process WASM + gRPC to Authorino + g
 Filter 3: ext_proc (BBR)            →  gRPC hop to BBR service (remaining plugins)
 ```
 
-Three filters, two ext_proc services to deploy, and the tight Kuadrant coupling remains unchanged. This solves the immediate unified-entry-point problem but does not address the underlying architectural constraints.
+This means two separate ext_proc gRPC hops per request (one to the lightweight service, one to the main BBR service), two ext_proc services to deploy and maintain, and the tight Kuadrant coupling remains unchanged. It solves the immediate unified-entry-point problem but does not address the underlying architectural constraints.
 
 ### The Tight Coupling Problem
 
