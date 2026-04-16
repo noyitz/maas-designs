@@ -106,6 +106,27 @@ This coupling introduces:
 
 ---
 
+## Proposed Solution: Auth and Rate Limiting as BBR Plugins
+
+The root cause of all the issues above is that auth and rate limiting live in a separate Envoy filter (Kuadrant WasmPlugin) that runs before BBR and cannot see the request body.
+
+The proposal is simple: **move auth and rate limiting into the BBR plugin chain itself.** BBR already parses the request body — so an auth plugin running inside BBR naturally has access to the model name, the request payload, and any data extracted by earlier plugins via CycleState.
+
+Instead of three filters coordinating across process boundaries, we have a single ext_proc with a well-defined plugin chain:
+
+1. **body-field-to-header** — extract model from body (existing plugin)
+2. **auth plugin** — call Authorino (or any auth backend) via gRPC, write identity to CycleState
+3. **rate-limit plugin** — call Limitador (or any metering system) via gRPC, enforce limits
+4. **model-provider-resolver** — resolve provider info (existing plugin)
+5. **api-translation** — translate request format (existing plugin)
+6. **apikey-injection** — inject provider credentials (existing plugin)
+
+The auth and rate-limit plugins are **swappable** — they implement the same BBR `RequestProcessor` interface as all other plugins. Authorino and Limitador ship as default backends ("batteries included"), but can be replaced with Keycloak, OpenMeter, or any other backend by changing a Helm value.
+
+This solves the unified entry point, eliminates multiple filter hops, and reduces the CRD translation chain from 3 layers to 1.
+
+---
+
 ## Architecture Comparison
 
 ### Side-by-Side Overview
