@@ -6,22 +6,6 @@
 
 ---
 
-## Table of Contents
-
-1. [Executive Summary](#executive-summary)
-2. [Problem Statement](#problem-statement)
-3. [Architecture Comparison](#architecture-comparison)
-   - [Approach A: Current Architecture](#approach-a-current-architecture-today)
-   - [Approach B: Lightweight ext_proc Before Kuadrant](#approach-b-lightweight-ext_proc-before-kuadrant)
-   - [Approach C: Unified BBR Pipeline (This Proposal)](#approach-c-unified-bbr-pipeline-this-proposal)
-4. [Detailed Design](#detailed-design)
-5. [Sequence Diagrams](#sequence-diagrams)
-6. [Comparison Matrix](#comparison-matrix)
-7. [Migration Path](#migration-path)
-8. [Open Questions](#open-questions)
-
----
-
 ## Executive Summary
 
 This proposal introduces an alternative approach to the unified entry point (RHAIRFE-1304) that decouples the gateway flow from the tight integration with RHCL/Kuadrant. Instead of adding a third Envoy filter to work around Kuadrant's limitations, we consolidate the entire request lifecycle — authentication, rate limiting, and payload processing — into a single BBR ext_proc pipeline with pluggable plugins.
