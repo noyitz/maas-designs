@@ -84,7 +84,20 @@ MaaSAuthPolicy → MaaS Controller → Kuadrant AuthPolicy → Kuadrant Operator
 MaaSSubscription → MaaS Controller → Kuadrant TRLP → Kuadrant Operator → Limitador Rules
 ```
 
+**Example: onboarding a single model.** When an admin adds a new model (e.g., `granite-3b`) and grants access to two teams with different rate limits, the following resources are created:
+
+| Layer | Resources Created |
+|-------|-------------------|
+| KServe | 1 LLMInferenceService, 1 HTTPRoute (auto-generated) |
+| MaaS | 1 MaaSModelRef, 2 MaaSAuthPolicy (one per team), 2 MaaSSubscription (one per team) |
+| Kuadrant (generated) | 1 AuthPolicy (aggregated), 1 TokenRateLimitPolicy (aggregated) |
+| Authorino (generated) | 1 AuthConfig (with auth rules for both teams) |
+| Limitador | Rate-limit rules configured per subscription |
+
+That's **9+ resources across 4 layers** for a single model with two teams. The auth rules and subscription data are duplicated at each layer — MaaS CRDs hold the source of truth, then the same information is translated into Kuadrant CRDs, which are translated again into Authorino/Limitador configs. Each translation is a reconciliation loop that can fail, drift, or race.
+
 This coupling introduces:
+- **Data duplication across layers** — auth rules and rate-limit configurations exist in three places (MaaS CRDs, Kuadrant CRDs, backend configs), each requiring reconciliation
 - **Deployment complexity** — Kuadrant operator requires CSV patching for OpenShift Gateway controller recognition, race conditions with `MissingDependency` status
 - **Architectural constraints** — WasmPlugin can't see request body, forcing model-in-path pattern
 - **Limited pluggability** — auth and rate-limiting are locked to Authorino and Limitador via Kuadrant's CRDs; no path to swap auth backends or replace Limitador with a metering system
