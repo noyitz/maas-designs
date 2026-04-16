@@ -117,57 +117,88 @@ This coupling introduces:
 
 ### Side-by-Side Overview
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ Approach A: Current (2 filters, tight Kuadrant coupling)                        │
-│                                                                                 │
-│   WasmPlugin (Kuadrant)              ext_proc (BBR)                             │
-│   ┌─────────────────────┐            ┌──────────────────────┐                   │
-│   │ WASM binary          │            │ body-field-to-header  │                   │
-│   │  → Authorino gRPC    │     ──►    │ provider-resolver     │                   │
-│   │  → Limitador gRPC    │            │ api-translation       │                   │
-│   │                      │            │ apikey-injection       │                   │
-│   │ ⚠ Can't see body     │            │                       │                   │
-│   └─────────────────────┘            └──────────────────────┘                   │
-│        filter 1                           filter 2                              │
-│                                                                                 │
-│   ⚠ Model MUST be in URL path. Kuadrant reads it from the path.                │
-│   ⚠ Per-model HTTPRoutes required for policy targeting.                         │
-└─────────────────────────────────────────────────────────────────────────────────┘
+#### Approach A: Current (2 filters, tight Kuadrant coupling)
 
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ Approach B: Lightweight ext_proc before Kuadrant (3 filters)                    │
-│                                                                                 │
-│   ext_proc (lightweight)   WasmPlugin (Kuadrant)    ext_proc (BBR)              │
-│   ┌───────────────────┐   ┌─────────────────────┐  ┌──────────────────────┐     │
-│   │ body-field-to-     │   │ WASM binary          │  │ provider-resolver     │     │
-│   │ header             │ ► │  → Authorino gRPC    │► │ api-translation       │     │
-│   │                    │   │  → Limitador gRPC    │  │ apikey-injection       │     │
-│   │ (model → header)   │   │                      │  │                       │     │
-│   └───────────────────┘   └─────────────────────┘  └──────────────────────┘     │
-│        filter 1                filter 2                 filter 3                │
-│                                                                                 │
-│   ⚠ 3 filters, 2 ext_proc services. Kuadrant coupling remains.                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+graph LR
+    subgraph filter1["Filter 1: WasmPlugin (Kuadrant)"]
+        direction TB
+        W1["WASM binary"]
+        W2["→ Authorino gRPC"]
+        W3["→ Limitador gRPC"]
+        W4["⚠ Can't see body"]
+        W1 --- W2 --- W3 --- W4
+    end
 
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ Approach C: Unified BBR Pipeline (this proposal — 1 filter, pluggable)          │
-│                                                                                 │
-│   ext_proc (BBR — single entry point)                                           │
-│   ┌────────────────────────────────────────────────────────────────────┐         │
-│   │ 1. body-field-to-header                                            │         │
-│   │ 2. auth-plugin → Authorino gRPC          ← plugin, swappable      │         │
-│   │ 3. rate-limit-plugin → Limitador gRPC    ← plugin, swappable      │         │
-│   │ 4. model-provider-resolver                                         │         │
-│   │ 5. api-translation                                                 │         │
-│   │ 6. apikey-injection                                                │         │
-│   └────────────────────────────────────────────────────────────────────┘         │
-│        single filter, single gRPC hop                                           │
-│                                                                                 │
-│   ✓ No Kuadrant dependency. Auth + rate-limit as swappable BBR plugins.         │
-│   ✓ Model read from body natively. No model in path required.                   │
-└─────────────────────────────────────────────────────────────────────────────────┘
+    subgraph filter2["Filter 2: ext_proc (BBR)"]
+        direction TB
+        B1["body-field-to-header"]
+        B2["provider-resolver"]
+        B3["api-translation"]
+        B4["apikey-injection"]
+        B1 --- B2 --- B3 --- B4
+    end
+
+    filter1 -->|gRPC hop| filter2
+
+    style W4 fill:#553333,color:#ff9999
 ```
+
+> **⚠ Model MUST be in URL path.** Kuadrant reads the model from the path to match per-model policies.
+> Per-model HTTPRoutes required for policy targeting.
+
+#### Approach B: Lightweight ext_proc before Kuadrant (3 filters)
+
+```mermaid
+graph LR
+    subgraph filter1["Filter 1: ext_proc (lightweight)"]
+        direction TB
+        L1["body-field-to-header"]
+        L2["(model → header)"]
+        L1 --- L2
+    end
+
+    subgraph filter2["Filter 2: WasmPlugin (Kuadrant)"]
+        direction TB
+        W1["WASM binary"]
+        W2["→ Authorino gRPC"]
+        W3["→ Limitador gRPC"]
+        W1 --- W2 --- W3
+    end
+
+    subgraph filter3["Filter 3: ext_proc (BBR)"]
+        direction TB
+        B1["provider-resolver"]
+        B2["api-translation"]
+        B3["apikey-injection"]
+        B1 --- B2 --- B3
+    end
+
+    filter1 -->|gRPC hop| filter2 -->|gRPC hop| filter3
+```
+
+> **⚠ 3 filters, 2 ext_proc services to deploy.** Kuadrant coupling remains unchanged.
+
+#### Approach C: Unified BBR Pipeline (this proposal — 1 filter, pluggable)
+
+```mermaid
+graph LR
+    subgraph filter1["Single Filter: ext_proc (BBR — single entry point)"]
+        direction TB
+        P1["1. body-field-to-header"]
+        P2["2. auth-plugin → Authorino gRPC — <i>plugin, swappable</i>"]
+        P3["3. rate-limit-plugin → Limitador gRPC — <i>plugin, swappable</i>"]
+        P4["4. model-provider-resolver"]
+        P5["5. api-translation"]
+        P6["6. apikey-injection"]
+        P1 --> P2 --> P3 --> P4 --> P5 --> P6
+    end
+
+    style filter1 fill:#1a3320,color:#88cc88
+```
+
+> **✅ Single filter, single gRPC hop.** No Kuadrant dependency.
+> Auth + rate-limit as swappable BBR plugins. Model read from body natively.
 
 ---
 
