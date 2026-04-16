@@ -7,9 +7,9 @@
 
 ## Executive Summary
 
-This is a proposal for the unified entry point requirement in RHOAI 3.5 ([RHAIRFE-1304](https://redhat.atlassian.net/browse/RHAIRFE-1304)) that leverages the existing BBR plugin framework while keeping core components (Authorino, Limitador) in place. It breaks the current coupling where auth and rate limiting are wrapped together in a single filter, forcing BBR to work around their limitations. By making auth and rate limiting pluggable BBR plugins, it also opens a clean path to integrate other auth mechanisms or external metering and circuit-breaker systems in the future.
+This is a proposal for the unified entry point requirement in RHOAI 3.5 ([RHAIRFE-1304](https://redhat.atlassian.net/browse/RHAIRFE-1304)) that leverages the existing BBR plugin framework while keeping core components (Authorino, Limitador) in place. It breaks the current coupling where auth and rate limiting are wrapped together in a single filter, forcing BBR to work around their limitations.
 
-The core idea: **BBR becomes the single orchestration layer**, with auth and rate-limiting as swappable plugins that call Kuadrant's core components (Authorino, Limitador) directly via gRPC. This decouples the gateway flow from the Kuadrant operator's orchestration layer (WasmPlugin, CRD translation) while preserving Kuadrant's proven auth and rate-limiting backends — and enabling future pluggability.
+The core idea: **BBR becomes the single orchestration layer**, with auth and rate-limiting as swappable plugins that call Kuadrant's core components (Authorino, Limitador) directly via gRPC. This decouples the gateway flow from the Kuadrant operator's orchestration layer (WasmPlugin, CRD translation) while preserving Kuadrant's proven auth and rate-limiting backends — and opens a clean path to integrate other auth mechanisms or external metering and circuit-breaker systems in the future.
 
 ---
 
