@@ -491,30 +491,6 @@ plugins:
     name: apikey-injection
 ```
 
-```yaml
-# Future: Keycloak + OpenMeter
-plugins:
-  - type: body-field-to-header
-    name: model-extractor
-    json:
-      fieldName: model
-      headerName: X-Gateway-Model-Name
-  - type: keycloak-auth              # ← swap auth backend
-    name: auth
-    json:
-      endpoint: "keycloak.auth-system.svc.cluster.local:8080"
-      realm: "maas"
-  - type: openmeter-metering         # ← swap to metering with circuit breaker
-    name: metering
-    json:
-      endpoint: "openmeter.billing.svc.cluster.local:8080"
-  - type: model-provider-resolver
-    name: model-provider-resolver
-  - type: api-translation
-    name: api-translation
-  - type: apikey-injection
-    name: apikey-injection
-```
 
 ### MaaS Controller Changes
 
