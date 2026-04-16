@@ -1,16 +1,15 @@
 # Proposal: Unified Gateway Flow via Pluggable BBR
 
 **Date:** April 15, 2026
-**Status:** Draft / RFC
-**Tracker:** [RHAIRFE-1304](https://redhat.atlassian.net/browse/RHAIRFE-1304) (Unified Entry Point)
+**Author:** Noy Itzikowitz
 
 ---
 
 ## Executive Summary
 
-This proposal introduces an alternative approach to the unified entry point (RHAIRFE-1304) that decouples the gateway flow from the tight integration with RHCL/Kuadrant. Instead of adding a third Envoy filter to work around Kuadrant's limitations, we consolidate the entire request lifecycle — authentication, rate limiting, and payload processing — into a single BBR ext_proc pipeline with pluggable plugins.
+This proposal introduces an alternative approach to the unified entry point ([RHAIRFE-1304](https://redhat.atlassian.net/browse/RHAIRFE-1304)) that decouples the gateway flow from the tight integration with RHCL/Kuadrant. Instead of adding a third Envoy filter to work around Kuadrant's limitations, we consolidate the entire request lifecycle — authentication, rate limiting, and payload processing — into a single BBR ext_proc pipeline with pluggable plugins.
 
-The core idea: **BBR becomes the single orchestration layer**, with auth and rate-limiting as swappable plugins that call existing backends (Authorino, Limitador) via gRPC. This removes the Kuadrant operator and WasmPlugin from the critical path while keeping proven backend services and enabling future pluggability.
+The core idea: **BBR becomes the single orchestration layer**, with auth and rate-limiting as swappable plugins that call Kuadrant's core components (Authorino, Limitador) directly via gRPC. This decouples the gateway flow from the Kuadrant operator's orchestration layer (WasmPlugin, CRD translation) while preserving Kuadrant's proven auth and rate-limiting backends — and enabling future pluggability.
 
 ---
 
@@ -689,7 +688,7 @@ sequenceDiagram
 
 1. **Solves unified entry point natively** — BBR sees the request body, so the model name is available to auth and rate-limit plugins without any workaround. No model in path required.
 
-2. **Removes Kuadrant operator dependency** — Eliminates CSV patching, WasmPlugin management, `MissingDependency` race conditions, and the entire Kuadrant CRD translation layer.
+2. **Decouples from Kuadrant operator orchestration** — Talks directly to Kuadrant's core components (Authorino, Limitador) instead of going through the operator's CRD translation layer. This eliminates the CSV patching, WasmPlugin management, and `MissingDependency` race conditions while still leveraging Kuadrant's proven backends.
 
 3. **Single Envoy filter** — One gRPC hop from Envoy to BBR, vs. two filters (current) or three filters (Approach B). Lower latency at the filter level.
 
@@ -699,7 +698,7 @@ sequenceDiagram
 
 6. **Aligns with upstream direction** — The 3.5 plan already calls for "Pluggable BBR framework as a vertical." This proposal is the natural conclusion of that direction.
 
-7. **Fewer moving parts** — Drop Kuadrant operator from the deployment. Keep only what's needed: Authorino (auth), Limitador (rate-limit), BBR (orchestration).
+7. **Fewer moving parts** — Streamline the deployment by talking directly to Kuadrant's core components: Authorino (auth) and Limitador (rate-limit), orchestrated by BBR.
 
 8. **Consistent extension model** — Everything in the gateway is a BBR plugin. Auth, rate-limit, payload processing, guardrails (TrustyAI), metering — all follow the same pattern.
 
@@ -735,14 +734,14 @@ sequenceDiagram
 
 ### Phase 2: Validate in Dev Environment
 - Deploy BBR with full plugin chain (auth + rate-limit + payload processing)
-- Remove Kuadrant WasmPlugin from the gateway
+- Decouple from Kuadrant WasmPlugin; connect to Authorino and Limitador directly
 - Validate unified entry point (`/v1/chat/completions` with model in body)
 - Performance testing: measure latency difference
 
 ### Phase 3: Update MaaS Controller
 - Stop creating Kuadrant AuthPolicy and TokenRateLimitPolicy CRDs
 - Create Authorino AuthConfig directly, or have BBR plugins read MaaS CRDs via informers
-- Update deployment scripts to remove Kuadrant operator installation
+- Update deployment scripts to simplify Kuadrant integration (direct backend communication)
 
 ### Phase 4: Production Rollout
 - Deploy alongside existing architecture (feature flag / separate gateway)
@@ -776,7 +775,7 @@ sequenceDiagram
 |-----------|---------|
 | `ai-gateway-payload-processing` | New `authorino-auth` and `limitador-ratelimit` plugins, updated `cmd/main.go`, updated Helm chart |
 | `models-as-a-service/maas-controller` | Stop creating Kuadrant CRDs. Create Authorino AuthConfig directly or configure BBR plugins via CRD/ConfigMap |
-| `models-as-a-service/deployment` | Remove Kuadrant operator installation, WasmPlugin, CSV patching. Simplify deploy script |
+| `models-as-a-service/deployment` | Simplify Kuadrant integration: direct communication with Authorino/Limitador, streamline deploy script |
 | `gateway-api-inference-extension` | Potential upstream proposals for auth/rate-limit plugin patterns in BBR framework |
 
 ---
