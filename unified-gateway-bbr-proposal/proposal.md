@@ -376,7 +376,9 @@ Provider-resolver WRITES:          api-translation / apikey-injection READ:
 
 ### Auth Plugin: `authorino-auth`
 
-Default implementation that calls Authorino's ext_authz gRPC API:
+Default implementation that calls Authorino's ext_authz gRPC API.
+
+> **Note:** The following code is an AI-generated example to illustrate the concept. Actual implementation may differ.
 
 ```go
 func (p *AuthorinoAuthPlugin) ProcessRequest(ctx context.Context, 
@@ -425,7 +427,9 @@ func (p *AuthorinoAuthPlugin) ProcessRequest(ctx context.Context,
 
 ### Rate-Limit Plugin: `limitador-ratelimit`
 
-Default implementation that calls Limitador's RLS gRPC API:
+Default implementation that calls Limitador's RLS gRPC API.
+
+> **Note:** The following code is an AI-generated example to illustrate the concept. Actual implementation may differ.
 
 ```go
 func (p *LimitadorPlugin) ProcessRequest(ctx context.Context,
@@ -504,169 +508,6 @@ The MaaS controller would stop creating Kuadrant CRDs and instead:
 
 ---
 
-## Sequence Diagrams
-
-### Current Architecture (Approach A) — Model in Path
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant E as Envoy
-    participant WP as Kuadrant WasmPlugin<br/>(in-process)
-    participant Auth as Authorino
-    participant API as MaaS API
-    participant Lim as Limitador
-    participant BBR as BBR ext_proc
-    participant M as Model Backend
-
-    C->>E: POST /llm/granite-3b/v1/chat/completions<br/>Authorization: Bearer sk-oai-xxx<br/>Body: {"model":"granite-3b","messages":[...]}
-
-    Note over E,WP: Filter 1: Kuadrant WasmPlugin
-
-    E->>WP: Evaluate AuthPolicy<br/>(matches path /llm/granite-3b/*)
-    WP->>Auth: gRPC Check() — headers + path
-    Auth->>API: HTTP POST /internal/v1/api-keys/validate
-    API-->>Auth: {valid: true, username: "nitzik", groups: ["team-a"]}
-    Auth-->>WP: ALLOW + identity headers
-
-    WP->>Lim: gRPC ShouldRateLimit()<br/>descriptors: {user: nitzik, model: granite-3b}
-    Lim-->>WP: OK (under limit)
-    WP-->>E: ALLOW — inject X-MaaS-Username, X-MaaS-Group headers
-
-    Note over E,BBR: Filter 2: BBR ext_proc
-
-    E->>BBR: gRPC ProcessRequest — headers + body
-    Note over BBR: body-field-to-header → provider-resolver<br/>→ api-translation → apikey-injection
-    BBR-->>E: Mutated headers + body
-
-    Note over E,M: Filter 3: Router
-
-    E->>M: Forward to granite-3b-predictor:8080
-    M-->>E: Response
-    E->>BBR: gRPC ProcessResponse — response body
-    Note over BBR: api-translation (reverse)
-    BBR-->>E: Translated response
-    E-->>C: OpenAI-format response
-```
-
-### Proposed Architecture (Approach C) — Model in Body Only
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant E as Envoy
-    participant BBR as BBR ext_proc<br/>(single filter)
-    participant Auth as Authorino
-    participant API as MaaS API
-    participant Lim as Limitador
-    participant M as Model Backend
-
-    C->>E: POST /v1/chat/completions<br/>Authorization: Bearer sk-oai-xxx<br/>Body: {"model":"granite-3b","messages":[...]}
-
-    Note over E,BBR: Single Filter: BBR ext_proc
-
-    E->>BBR: gRPC ProcessRequest — headers + body
-
-    Note over BBR: Plugin 1: body-field-to-header
-    Note over BBR: Extracts "granite-3b" from body<br/>Sets X-Gateway-Model-Name header<br/>Writes "model" to CycleState
-
-    Note over BBR: Plugin 2: authorino-auth
-    BBR->>Auth: gRPC Check() — headers (incl. model header)
-    Auth->>API: HTTP POST /internal/v1/api-keys/validate
-    API-->>Auth: {valid: true, username: "nitzik", groups: ["team-a"]}
-    Auth-->>BBR: ALLOW + identity
-    Note over BBR: Writes username, groups,<br/>subscription-key to CycleState
-
-    Note over BBR: Plugin 3: limitador-ratelimit
-    BBR->>Lim: gRPC ShouldRateLimit()<br/>descriptors from CycleState
-    Lim-->>BBR: OK (under limit)
-
-    Note over BBR: Plugin 4-6: provider-resolver → api-translation → apikey-injection
-    Note over BBR: (existing plugins, unchanged)
-
-    BBR-->>E: Mutated headers + body + target endpoint
-
-    Note over E,M: Router
-
-    E->>M: Forward to resolved backend
-    M-->>E: Response
-    E->>BBR: gRPC ProcessResponse
-    Note over BBR: api-translation (reverse)
-    BBR-->>E: Translated response
-    E-->>C: OpenAI-format response
-```
-
-### Approach B for Reference — Three Filters
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant E as Envoy
-    participant LBR as Lightweight ext_proc
-    participant WP as Kuadrant WasmPlugin
-    participant Auth as Authorino
-    participant Lim as Limitador
-    participant BBR as BBR ext_proc
-    participant M as Model Backend
-
-    C->>E: POST /v1/chat/completions<br/>Body: {"model":"granite-3b",...}
-
-    Note over E,LBR: Filter 1: Lightweight ext_proc
-    E->>LBR: gRPC — headers + body
-    Note over LBR: Extracts model → X-Gateway-Model-Name header
-    LBR-->>E: Header mutation only
-
-    Note over E,WP: Filter 2: Kuadrant WasmPlugin
-    E->>WP: Evaluate policies (can see model header now)
-    WP->>Auth: gRPC Check()
-    Auth-->>WP: ALLOW
-    WP->>Lim: gRPC ShouldRateLimit()
-    Lim-->>WP: OK
-    WP-->>E: ALLOW
-
-    Note over E,BBR: Filter 3: BBR ext_proc
-    E->>BBR: gRPC — headers + body
-    Note over BBR: provider-resolver → api-translation → apikey-injection
-    BBR-->>E: Mutated headers + body
-
-    E->>M: Forward to backend
-    M-->>C: Response (via BBR reverse translation)
-```
-
-### Auth Plugin Swap — Future State with Keycloak
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant E as Envoy
-    participant BBR as BBR ext_proc
-    participant KC as Keycloak
-    participant OM as OpenMeter
-    participant M as Model Backend
-
-    C->>E: POST /v1/chat/completions<br/>Authorization: Bearer eyJhbGc...<br/>Body: {"model":"granite-3b",...}
-
-    E->>BBR: gRPC ProcessRequest
-
-    Note over BBR: Plugin 1: body-field-to-header
-
-    Note over BBR: Plugin 2: keycloak-auth (swapped)
-    BBR->>KC: Token introspection / UserInfo
-    KC-->>BBR: {active: true, sub: "nitzik", groups: [...]}
-    Note over BBR: Writes identity to CycleState
-
-    Note over BBR: Plugin 3: openmeter-metering (swapped)
-    BBR->>OM: Usage check + record
-    OM-->>BBR: {allowed: true, remaining: 4500}
-
-    Note over BBR: Plugins 4-6: unchanged
-
-    BBR-->>E: Processed request
-    E->>M: Forward
-```
-
----
-
 ## Comparison Matrix
 
 | Aspect | A: Current | B: Extra ext_proc | C: Unified BBR (Proposed) |
@@ -731,32 +572,6 @@ sequenceDiagram
 
 6. **Upstream framework changes may be needed** — The BBR plugin interface may need minor extensions (e.g., formal `AuthPlugin` interface, richer error response bodies).
    - *Mitigation:* Current `RequestProcessor` interface already supports returning typed errors that map to HTTP status codes. Minimal changes expected.
-
----
-
-## Migration Path
-
-### Phase 1: Build Plugins (No Production Impact)
-- Implement `authorino-auth` plugin in `ai-gateway-payload-processing`
-- Implement `limitador-ratelimit` plugin in `ai-gateway-payload-processing`
-- Register plugins in `cmd/main.go`
-- Unit and integration tests
-
-### Phase 2: Validate in Dev Environment
-- Deploy BBR with full plugin chain (auth + rate-limit + payload processing)
-- Decouple from Kuadrant WasmPlugin; connect to Authorino and Limitador directly
-- Validate unified entry point (`/v1/chat/completions` with model in body)
-- Performance testing: measure latency difference
-
-### Phase 3: Update MaaS Controller
-- Stop creating Kuadrant AuthPolicy and TokenRateLimitPolicy CRDs
-- Create Authorino AuthConfig directly, or have BBR plugins read MaaS CRDs via informers
-- Update deployment scripts to simplify Kuadrant integration (direct backend communication)
-
-### Phase 4: Production Rollout
-- Deploy alongside existing architecture (feature flag / separate gateway)
-- Gradual migration of models to new flow
-- Deprecate Kuadrant-based flow
 
 ---
 
